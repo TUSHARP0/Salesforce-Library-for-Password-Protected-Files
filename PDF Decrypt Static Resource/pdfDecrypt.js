@@ -4,7 +4,6 @@
  * Compatible with Locker Service - no external dependencies
  * 
  * @author Tushar
- * @version 1.0.0
  */
 (function(global) {
     'use strict';
@@ -114,6 +113,151 @@
                 }
             }
             return data.slice(0, data.length - padding);
+        },
+
+        /**
+         * Build a searchable Latin-1 string from PDF bytes.
+         * For large PDFs, encryption/trailer markers live near the end, so we
+         * always include both the head and the tail (not just the first 50KB).
+         */
+        getSearchablePdfText: function(pdfData, headBytes, tailBytes) {
+            if (!(pdfData instanceof Uint8Array)) {
+                pdfData = new Uint8Array(pdfData);
+            }
+            headBytes = headBytes || 65536;
+            tailBytes = tailBytes || 131072;
+
+            // Modest files: search the entire document
+            if (pdfData.length <= headBytes + tailBytes) {
+                return this.bytesToString(pdfData);
+            }
+
+            const head = this.bytesToString(pdfData.subarray(0, headBytes));
+            const tail = this.bytesToString(pdfData.subarray(pdfData.length - tailBytes));
+            return head + '\n' + tail;
+        },
+
+        /**
+         * True if raw PDF bytes contain standard encryption markers.
+         */
+        hasEncryptionMarkers: function(pdfData) {
+            const pdfStr = this.getSearchablePdfText(pdfData);
+            return pdfStr.includes('/Filter/Standard') ||
+                   pdfStr.includes('/Filter /Standard') ||
+                   /\/Encrypt\s+\d+\s+\d+\s+R/.test(pdfStr);
+        }
+    };
+
+    // ============================================
+    // SECTION 1b: STREAM PREDICTOR (PNG / TIFF)
+    // Required for many large PDF XRef streams
+    // ============================================
+
+    const StreamPredictor = {
+        paeth: function(a, b, c) {
+            const p = a + b - c;
+            const pa = Math.abs(p - a);
+            const pb = Math.abs(p - b);
+            const pc = Math.abs(p - c);
+            if (pa <= pb && pa <= pc) return a;
+            if (pb <= pc) return b;
+            return c;
+        },
+
+        /**
+         * Undo PNG/TIFF predictors after FlateDecode.
+         * PDF DecodeParms: /Predictor, /Columns, /Colors, /BitsPerComponent
+         */
+        apply: function(data, params) {
+            if (!params || !(data instanceof Uint8Array) || data.length === 0) {
+                return data;
+            }
+
+            const predictor = params['/Predictor'] || params.Predictor || 1;
+            if (predictor <= 1) {
+                return data;
+            }
+
+            const columns = params['/Columns'] || params.Columns || 1;
+            const colors = params['/Colors'] || params.Colors || 1;
+            const bpc = params['/BitsPerComponent'] || params.BitsPerComponent || 8;
+            const rowLength = Math.ceil((columns * colors * bpc) / 8);
+            if (rowLength <= 0) {
+                return data;
+            }
+
+            // TIFF predictor
+            if (predictor === 2) {
+                const rowCount = Math.floor(data.length / rowLength);
+                const output = new Uint8Array(rowCount * rowLength);
+                const bpp = Math.max(1, Math.ceil((colors * bpc) / 8));
+
+                for (let i = 0; i < rowCount; i++) {
+                    const rowStart = i * rowLength;
+                    for (let j = 0; j < rowLength; j++) {
+                        const raw = data[rowStart + j];
+                        const left = j >= bpp ? output[rowStart + j - bpp] : 0;
+                        output[rowStart + j] = (raw + left) & 0xFF;
+                    }
+                }
+                return output;
+            }
+
+            // PNG predictors (10-15): each row starts with a filter-type byte
+            if (predictor >= 10 && predictor <= 15) {
+                const bytesPerRow = rowLength + 1;
+                const rowCount = Math.floor(data.length / bytesPerRow);
+                if (rowCount === 0) {
+                    return data;
+                }
+
+                const output = new Uint8Array(rowCount * rowLength);
+                const bpp = Math.max(1, Math.ceil((colors * bpc) / 8));
+                let prev = new Uint8Array(rowLength);
+
+                for (let i = 0; i < rowCount; i++) {
+                    const rowStart = i * bytesPerRow;
+                    const filterType = data[rowStart];
+                    const outOffset = i * rowLength;
+
+                    for (let j = 0; j < rowLength; j++) {
+                        const raw = data[rowStart + 1 + j];
+                        const left = j >= bpp ? output[outOffset + j - bpp] : 0;
+                        const up = prev[j];
+                        const upLeft = j >= bpp ? prev[j - bpp] : 0;
+                        let val = raw;
+
+                        switch (filterType) {
+                            case 1: // Sub
+                                val = (raw + left) & 0xFF;
+                                break;
+                            case 2: // Up
+                                val = (raw + up) & 0xFF;
+                                break;
+                            case 3: // Average
+                                val = (raw + ((left + up) >> 1)) & 0xFF;
+                                break;
+                            case 4: // Paeth
+                                val = (raw + this.paeth(left, up, upLeft)) & 0xFF;
+                                break;
+                            default: // None (0) or unknown
+                                val = raw;
+                                break;
+                        }
+
+                        output[outOffset + j] = val;
+                    }
+
+                    prev = output.subarray(outOffset, outOffset + rowLength);
+                }
+
+                console.log('PDFDecrypt: Applied PNG predictor', predictor,
+                    'columns=', columns, 'rows=', rowCount,
+                    'in=', data.length, 'out=', output.length);
+                return output;
+            }
+
+            return data;
         }
     };
 
@@ -651,6 +795,40 @@
             },
 
             /**
+             * AES-CBC decrypt without PKCS7 unpadding (UE/OE use no padding).
+             */
+            decryptCBCNoPad: function(key, iv, data) {
+                const { expandedKey, rounds } = keyExpansion(key);
+                const result = new Uint8Array(data.length);
+                let prevBlock = iv;
+
+                for (let offset = 0; offset < data.length; offset += 16) {
+                    const block = data.slice(offset, offset + 16);
+                    const state = new Uint8Array(block);
+
+                    addRoundKey(state, expandedKey.slice(rounds * 16, (rounds + 1) * 16));
+
+                    for (let round = rounds - 1; round > 0; round--) {
+                        invShiftRows(state);
+                        invSubBytes(state);
+                        addRoundKey(state, expandedKey.slice(round * 16, (round + 1) * 16));
+                        invMixColumns(state);
+                    }
+
+                    invShiftRows(state);
+                    invSubBytes(state);
+                    addRoundKey(state, expandedKey.slice(0, 16));
+
+                    for (let i = 0; i < 16; i++) {
+                        result[offset + i] = state[i] ^ prevBlock[i];
+                    }
+                    prevBlock = block;
+                }
+
+                return result;
+            },
+
+            /**
              * AES encrypt (CBC mode)
              */
             encryptCBC: function(key, iv, data) {
@@ -719,11 +897,20 @@
                 this.bitPos = 0;
                 this.buffer = 0;
                 this.bufferBits = 0;
+                this.eof = false;
             }
 
             readBits(n) {
                 while (this.bufferBits < n) {
                     if (this.pos >= this.data.length) {
+                        this.eof = true;
+                        // Return what we have, padded with zeros
+                        if (this.bufferBits > 0) {
+                            const result = this.buffer & ((1 << Math.min(n, this.bufferBits)) - 1);
+                            this.buffer = 0;
+                            this.bufferBits = 0;
+                            return result;
+                        }
                         throw new Error('Unexpected end of data');
                     }
                     this.buffer |= this.data[this.pos++] << this.bufferBits;
@@ -738,12 +925,20 @@
             readByte() {
                 this.buffer = 0;
                 this.bufferBits = 0;
+                if (this.pos >= this.data.length) {
+                    this.eof = true;
+                    return 0;
+                }
                 return this.data[this.pos++];
             }
 
             alignToByte() {
                 this.buffer = 0;
                 this.bufferBits = 0;
+            }
+            
+            hasMoreData() {
+                return this.pos < this.data.length || this.bufferBits > 0;
             }
         }
 
@@ -789,12 +984,24 @@
             let len = 0;
             
             while (len < huffman.maxLen) {
-                bits |= reader.readBits(1) << len;
+                try {
+                    bits |= reader.readBits(1) << len;
+                } catch (e) {
+                    // EOF reached - return end of block symbol if we have partial match
+                    if (reader.eof) {
+                        return 256; // End of block
+                    }
+                    throw e;
+                }
                 len++;
                 const entry = huffman.table[bits];
                 if (entry !== -1 && (entry & 0xFF) === len) {
                     return entry >> 8;
                 }
+            }
+            // If we can't decode, assume end of block
+            if (reader.eof) {
+                return 256;
             }
             throw new Error('Invalid Huffman code');
         }
@@ -818,91 +1025,106 @@
                 const output = [];
                 let bfinal = 0;
 
-                while (!bfinal) {
-                    bfinal = reader.readBits(1);
-                    const btype = reader.readBits(2);
+                try {
+                    while (!bfinal && !reader.eof) {
+                        bfinal = reader.readBits(1);
+                        const btype = reader.readBits(2);
 
-                    if (btype === 0) {
-                        // Stored block
-                        reader.alignToByte();
-                        const len = reader.readByte() | (reader.readByte() << 8);
-                        reader.readByte(); reader.readByte(); // nlen
-                        for (let i = 0; i < len; i++) {
-                            output.push(reader.readByte());
-                        }
-                    } else if (btype === 1 || btype === 2) {
-                        // Compressed block
-                        let litHuffman, distHuffman;
-
-                        if (btype === 1) {
-                            // Fixed Huffman
-                            litHuffman = buildHuffmanTable(FIXED_LITERAL_LENGTHS);
-                            distHuffman = buildHuffmanTable(FIXED_DISTANCE_LENGTHS);
-                        } else {
-                            // Dynamic Huffman
-                            const hlit = reader.readBits(5) + 257;
-                            const hdist = reader.readBits(5) + 1;
-                            const hclen = reader.readBits(4) + 4;
-
-                            const codeLengths = new Uint8Array(19);
-                            for (let i = 0; i < hclen; i++) {
-                                codeLengths[CODE_ORDER[i]] = reader.readBits(3);
+                        if (btype === 0) {
+                            // Stored block
+                            reader.alignToByte();
+                            const len = reader.readByte() | (reader.readByte() << 8);
+                            reader.readByte(); reader.readByte(); // nlen
+                            for (let i = 0; i < len && !reader.eof; i++) {
+                                output.push(reader.readByte());
                             }
+                        } else if (btype === 1 || btype === 2) {
+                            // Compressed block
+                            let litHuffman, distHuffman;
 
-                            const codeHuffman = buildHuffmanTable(codeLengths);
-                            const lengths = new Uint8Array(hlit + hdist);
-                            let i = 0;
-
-                            while (i < hlit + hdist) {
-                                const sym = decodeSymbol(reader, codeHuffman);
-                                if (sym < 16) {
-                                    lengths[i++] = sym;
-                                } else if (sym === 16) {
-                                    const repeat = reader.readBits(2) + 3;
-                                    for (let j = 0; j < repeat; j++) {
-                                        lengths[i] = lengths[i - 1];
-                                        i++;
-                                    }
-                                } else if (sym === 17) {
-                                    i += reader.readBits(3) + 3;
-                                } else {
-                                    i += reader.readBits(7) + 11;
-                                }
-                            }
-
-                            litHuffman = buildHuffmanTable(lengths.slice(0, hlit));
-                            distHuffman = buildHuffmanTable(lengths.slice(hlit));
-                        }
-
-                        // Decode symbols
-                        while (true) {
-                            const sym = decodeSymbol(reader, litHuffman);
-                            if (sym < 256) {
-                                output.push(sym);
-                            } else if (sym === 256) {
-                                break;
+                            if (btype === 1) {
+                                // Fixed Huffman
+                                litHuffman = buildHuffmanTable(FIXED_LITERAL_LENGTHS);
+                                distHuffman = buildHuffmanTable(FIXED_DISTANCE_LENGTHS);
                             } else {
-                                const lenIdx = sym - 257;
-                                let length = LENGTH_BASE[lenIdx];
-                                if (LENGTH_EXTRA[lenIdx] > 0) {
-                                    length += reader.readBits(LENGTH_EXTRA[lenIdx]);
+                                // Dynamic Huffman
+                                const hlit = reader.readBits(5) + 257;
+                                const hdist = reader.readBits(5) + 1;
+                                const hclen = reader.readBits(4) + 4;
+
+                                const codeLengths = new Uint8Array(19);
+                                for (let i = 0; i < hclen; i++) {
+                                    codeLengths[CODE_ORDER[i]] = reader.readBits(3);
                                 }
 
-                                const distSym = decodeSymbol(reader, distHuffman);
-                                let distance = DIST_BASE[distSym];
-                                if (DIST_EXTRA[distSym] > 0) {
-                                    distance += reader.readBits(DIST_EXTRA[distSym]);
+                                const codeHuffman = buildHuffmanTable(codeLengths);
+                                const lengths = new Uint8Array(hlit + hdist);
+                                let i = 0;
+
+                                while (i < hlit + hdist && !reader.eof) {
+                                    const sym = decodeSymbol(reader, codeHuffman);
+                                    if (sym < 16) {
+                                        lengths[i++] = sym;
+                                    } else if (sym === 16) {
+                                        const repeat = reader.readBits(2) + 3;
+                                        for (let j = 0; j < repeat && i < hlit + hdist; j++) {
+                                            lengths[i] = lengths[i - 1];
+                                            i++;
+                                        }
+                                    } else if (sym === 17) {
+                                        i += reader.readBits(3) + 3;
+                                    } else {
+                                        i += reader.readBits(7) + 11;
+                                    }
                                 }
 
-                                const start = output.length - distance;
-                                for (let j = 0; j < length; j++) {
-                                    output.push(output[start + j]);
+                                litHuffman = buildHuffmanTable(lengths.slice(0, hlit));
+                                distHuffman = buildHuffmanTable(lengths.slice(hlit));
+                            }
+
+                            // Decode symbols
+                            while (!reader.eof) {
+                                const sym = decodeSymbol(reader, litHuffman);
+                                if (sym < 256) {
+                                    output.push(sym);
+                                } else if (sym === 256) {
+                                    break;
+                                } else {
+                                    const lenIdx = sym - 257;
+                                    if (lenIdx < 0 || lenIdx >= LENGTH_BASE.length) {
+                                        break; // Invalid length code
+                                    }
+                                    let length = LENGTH_BASE[lenIdx];
+                                    if (LENGTH_EXTRA[lenIdx] > 0) {
+                                        length += reader.readBits(LENGTH_EXTRA[lenIdx]);
+                                    }
+
+                                    const distSym = decodeSymbol(reader, distHuffman);
+                                    if (distSym < 0 || distSym >= DIST_BASE.length) {
+                                        break; // Invalid distance code
+                                    }
+                                    let distance = DIST_BASE[distSym];
+                                    if (DIST_EXTRA[distSym] > 0) {
+                                        distance += reader.readBits(DIST_EXTRA[distSym]);
+                                    }
+
+                                    const start = output.length - distance;
+                                    for (let j = 0; j < length; j++) {
+                                        output.push(output[start + j]);
+                                    }
                                 }
                             }
+                        } else if (btype === 3) {
+                            throw new Error('Invalid block type 3');
                         }
-                    } else {
-                        throw new Error('Invalid block type');
                     }
+                } catch (e) {
+                    // If we have some output, return it instead of failing completely
+                    if (output.length > 0) {
+                        console.warn('PDFDecrypt: Inflate ended early with error:', e.message, 'Returning', output.length, 'bytes');
+                        return new Uint8Array(output);
+                    }
+                    throw e;
                 }
 
                 return new Uint8Array(output);
@@ -920,6 +1142,7 @@
             this.pos = 0;
             this.objects = new Map();
             this.xref = new Map();
+            this.objectStreams = new Map(); // Track objects stored in object streams (type 2)
             this.trailer = null;
             this.encryptDict = null;
             this.idArray = null;
@@ -959,23 +1182,192 @@
             // Find startxref
             const startxrefPos = this.findStringReverse('startxref');
             if (startxrefPos === -1) {
-                throw new Error('Cannot find startxref');
+                console.warn('PDFDecrypt: Cannot find startxref, falling back to object scan');
+                this.scanForObjects();
+                return;
             }
 
             this.pos = startxrefPos + 9;
             this.skipWhitespace();
-            const xrefOffset = this.parseNumber();
+            let xrefOffset = this.parseNumber();
 
-            this.pos = xrefOffset;
-            this.skipWhitespace();
+            // Process all xref sections (following /Prev chain for incremental updates)
+            const processedOffsets = new Set();
+            let parseSuccess = false;
+            
+            while (xrefOffset && !processedOffsets.has(xrefOffset)) {
+                processedOffsets.add(xrefOffset);
+                
+                this.pos = xrefOffset;
+                this.skipWhitespace();
 
-            // Check if it's xref table or xref stream
-            const next5 = Utils.bytesToString(this.data.slice(this.pos, this.pos + 5));
-            if (next5.startsWith('xref')) {
-                this.parseXRefTable();
+                // Check if it's xref table or xref stream
+                const next5 = Utils.bytesToString(this.data.slice(this.pos, this.pos + 5));
+                let prevOffset = null;
+                
+                try {
+                    if (next5.startsWith('xref')) {
+                        prevOffset = this.parseXRefTable();
+                        parseSuccess = true;
+                    } else {
+                        // XRef stream
+                        prevOffset = this.parseXRefStream(xrefOffset);
+                        parseSuccess = true;
+                    }
+                } catch (e) {
+                    console.warn('PDFDecrypt: XRef parsing failed at offset', xrefOffset, ':', e.message);
+                    // Try to continue with other xref sections or fallback
+                    break;
+                }
+                
+                // Follow /Prev chain
+                xrefOffset = prevOffset;
+            }
+            
+            // If XRef parsing failed or found no objects, fallback to scanning
+            // If XRef parsing failed or found too few objects, fallback to scanning
+            if (!parseSuccess || this.xref.size === 0) {
+                console.log('PDFDecrypt: XRef parsing incomplete, scanning for objects...');
+                this.scanForObjects();
+            }
+            
+            // Always ensure we have complete object list by scanning
+            // XRef stream may have ended early
+            const initialCount = this.xref.size;
+            this.scanForObjects();
+            if (this.xref.size > initialCount) {
+                console.log('PDFDecrypt: Scanning found', this.xref.size - initialCount, 'additional objects');
+            }
+            
+            console.log('PDFDecrypt: Parsed', this.xref.size, 'direct objects,', this.objectStreams.size, 'objects in streams');
+        }
+        
+        /**
+         * Fallback method: Scan through PDF to find objects
+         */
+        scanForObjects() {
+            const objPattern = /(\d+)\s+(\d+)\s+obj/g;
+            const pdfStr = Utils.bytesToString(this.data);
+            let match;
+            
+            while ((match = objPattern.exec(pdfStr)) !== null) {
+                const num = parseInt(match[1], 10);
+                const gen = parseInt(match[2], 10);
+                const offset = match.index;
+                const key = `${num} ${gen}`;
+                
+                if (!this.xref.has(key)) {
+                    this.xref.set(key, { offset, gen, type: 'n' });
+                } else {
+                    // Prefer scanned offsets when existing XRef offset is bogus
+                    // (common when XRef stream was inflated without decrypting first)
+                    const existing = this.xref.get(key);
+                    if (!existing || typeof existing.offset !== 'number' ||
+                        existing.offset < 0 || existing.offset >= this.data.length) {
+                        this.xref.set(key, { offset, gen, type: 'n' });
+                    }
+                }
+            }
+            
+            // Try to find trailer if not already parsed
+            if (!this.trailer) {
+                const trailerPos = pdfStr.lastIndexOf('trailer');
+                if (trailerPos !== -1) {
+                    this.pos = trailerPos + 7;
+                    this.skipWhitespace();
+                    try {
+                        this.trailer = this.parseDictionary();
+                    } catch (e) {
+                        console.warn('PDFDecrypt: Could not parse trailer:', e.message);
+                    }
+                }
+            }
+            
+            // If trailer exists but has no /Encrypt, check if XRef stream has it
+            // Also look for /Encrypt directly in PDF (for hybrid PDFs)
+            if (!this.trailer || !this.trailer['/Encrypt']) {
+                this.findEncryptDictDirect(pdfStr);
+            }
+        }
+        
+        /**
+         * Directly search for encryption dictionary in PDF
+         */
+        findEncryptDictDirect(pdfStr) {
+            console.log('PDFDecrypt: Searching for encryption info directly in PDF...');
+            
+            // Prefer the last /Encrypt reference (trailer / latest incremental update).
+            // On large PDFs this is near the end; first match may be stale or absent in head.
+            let encryptObjNum = null;
+            let encryptGen = null;
+            const encryptRefRe = /\/Encrypt\s+(\d+)\s+(\d+)\s+R/g;
+            let encryptRefMatch;
+            while ((encryptRefMatch = encryptRefRe.exec(pdfStr)) !== null) {
+                encryptObjNum = parseInt(encryptRefMatch[1], 10);
+                encryptGen = parseInt(encryptRefMatch[2], 10);
+            }
+
+            if (encryptObjNum !== null) {
+                console.log('PDFDecrypt: Found /Encrypt reference to object', encryptObjNum, encryptGen);
+                
+                if (!this.trailer) {
+                    this.trailer = {};
+                }
+                this.trailer['/Encrypt'] = { ref: true, num: encryptObjNum, gen: encryptGen };
+                
+                // Make sure this object is in xref
+                const key = `${encryptObjNum} ${encryptGen}`;
+                if (!this.xref.has(key)) {
+                    // Find the object (last occurrence wins for incremental updates)
+                    const objPattern = new RegExp(`${encryptObjNum}\\s+${encryptGen}\\s+obj`, 'g');
+                    let objMatch;
+                    let lastIndex = -1;
+                    while ((objMatch = objPattern.exec(pdfStr)) !== null) {
+                        lastIndex = objMatch.index;
+                    }
+                    if (lastIndex !== -1) {
+                        this.xref.set(key, { offset: lastIndex, gen: encryptGen, type: 'n' });
+                        console.log('PDFDecrypt: Added encrypt object to xref at offset', lastIndex);
+                    }
+                }
             } else {
-                // XRef stream
-                this.parseXRefStream(xrefOffset);
+                // Check if /Encrypt exists without being a reference (inline or in XRef stream dict)
+                // Look for standard security handler markers
+                if (pdfStr.includes('/Filter/Standard') || pdfStr.includes('/Filter /Standard')) {
+                    console.log('PDFDecrypt: Found /Filter /Standard - PDF appears encrypted');
+                    // This PDF has encryption, we need to find the encrypt dict
+                    // Look in XRef stream dictionaries
+                    const xrefStreamMatch = pdfStr.match(/\/Type\s*\/XRef[\s\S]{0,500}\/Encrypt/);
+                    if (xrefStreamMatch) {
+                        console.log('PDFDecrypt: Encryption info is in XRef stream dictionary');
+                    }
+                }
+            }
+            
+            // Also look for /ID array which is needed for encryption
+            if (!this.trailer || !this.trailer['/ID']) {
+                const idMatch = pdfStr.match(/\/ID\s*\[\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\]/);
+                if (idMatch) {
+                    if (!this.trailer) {
+                        this.trailer = {};
+                    }
+                    this.trailer['/ID'] = [
+                        Utils.hexToBytes(idMatch[1]),
+                        Utils.hexToBytes(idMatch[2])
+                    ];
+                    console.log('PDFDecrypt: Found /ID array');
+                }
+            }
+            
+            // Look for /Root reference
+            if (!this.trailer || !this.trailer['/Root']) {
+                const rootMatch = pdfStr.match(/\/Root\s+(\d+)\s+(\d+)\s+R/);
+                if (rootMatch) {
+                    if (!this.trailer) {
+                        this.trailer = {};
+                    }
+                    this.trailer['/Root'] = { ref: true, num: parseInt(rootMatch[1], 10), gen: parseInt(rootMatch[2], 10) };
+                }
             }
         }
 
@@ -999,18 +1391,39 @@
                     const type = String.fromCharCode(this.data[this.pos++]);
                     this.skipWhitespace();
 
-                    if (type === 'n') {
-                        this.xref.set(`${start + i} ${gen}`, { offset, gen, type: 'n' });
+                    const key = `${start + i} ${gen}`;
+                    // Only add if not already present (later xref entries take precedence)
+                    if (type === 'n' && !this.xref.has(key)) {
+                        this.xref.set(key, { offset, gen, type: 'n' });
                     }
                 }
             }
+            
+            // Parse trailer for this xref section
+            this.skipWhitespace();
+            const trailerPos = this.findString('trailer', this.pos);
+            if (trailerPos !== -1 && trailerPos < this.pos + 100) {
+                this.pos = trailerPos + 7;
+                this.skipWhitespace();
+                const trailerDict = this.parseDictionary();
+                
+                // Store first trailer (most recent) as main trailer
+                if (!this.trailer) {
+                    this.trailer = trailerDict;
+                }
+                
+                // Return /Prev offset if present
+                return trailerDict['/Prev'] || null;
+            }
+            
+            return null;
         }
 
-        parseXRefStream(offset) {
+        parseXRefStream(offset, decryptor = null) {
             this.pos = offset;
             this.skipWhitespace();
             
-            // Parse object number
+            // Parse object number (needed to decrypt the XRef stream itself)
             const objNum = this.parseNumber();
             this.skipWhitespace();
             const genNum = this.parseNumber();
@@ -1020,37 +1433,154 @@
             this.pos += 3;
             this.skipWhitespace();
             
-            // Parse dictionary
+            // Parse dictionary (plaintext even when document is encrypted)
             const dict = this.parseDictionary();
             
             // Get stream data
             this.skipWhitespace();
             const streamPos = this.findString('stream', this.pos);
+            if (streamPos === -1) {
+                throw new Error('Cannot find stream keyword in XRef stream');
+            }
             this.pos = streamPos + 6;
             if (this.data[this.pos] === 0x0D) this.pos++;
             if (this.data[this.pos] === 0x0A) this.pos++;
-            
-            const streamLength = dict.Length || dict['/Length'];
-            const streamData = this.data.slice(this.pos, this.pos + streamLength);
-            
-            // Decompress
-            let decoded = streamData;
-            const filter = dict.Filter || dict['/Filter'];
-            if (filter === '/FlateDecode' || filter === 'FlateDecode') {
-                decoded = Inflate.inflate(streamData);
+
+            const streamDataStart = this.pos;
+
+            // Always locate endstream — Length alone is unreliable / may exclude bytes
+            const endMarker = Utils.stringToBytes('endstream');
+            let endstreamPos = -1;
+            outerEnd: for (let i = streamDataStart; i <= this.data.length - endMarker.length; i++) {
+                for (let j = 0; j < endMarker.length; j++) {
+                    if (this.data[i + j] !== endMarker[j]) continue outerEnd;
+                }
+                endstreamPos = i;
+                break;
+            }
+            if (endstreamPos === -1) {
+                throw new Error('Cannot find endstream in XRef stream');
+            }
+
+            let dictLength = dict.Length || dict['/Length'];
+            if (typeof dictLength === 'object' && dictLength && dictLength.ref) {
+                // Indirect length — resolve if possible, else fall back to endstream
+                try {
+                    const lenObj = this.getObject(dictLength.num, dictLength.gen);
+                    dictLength = (typeof lenObj === 'number') ? lenObj : null;
+                } catch (e) {
+                    dictLength = null;
+                }
+            }
+
+            let streamLength = endstreamPos - streamDataStart;
+            while (streamLength > 0 &&
+                   (this.data[streamDataStart + streamLength - 1] === 0x0A ||
+                    this.data[streamDataStart + streamLength - 1] === 0x0D)) {
+                streamLength--;
+            }
+
+            // Prefer declared Length when it looks sane; otherwise use endstream span
+            if (typeof dictLength === 'number' && dictLength > 0 &&
+                dictLength <= streamLength && dictLength >= streamLength - 4) {
+                streamLength = dictLength;
+            }
+
+            let streamData = this.data.slice(streamDataStart, streamDataStart + streamLength);
+
+            // CRITICAL: In encrypted PDFs the XRef *stream bytes* are encrypted.
+            // Decrypt before FlateDecode, otherwise entries/offsets are garbage.
+            if (decryptor && decryptor.isEncrypted()) {
+                try {
+                    const before = streamData.length;
+                    streamData = decryptor.decryptStream(streamData, objNum, genNum);
+                    console.log('PDFDecrypt: Decrypted XRef stream obj', objNum,
+                        'gen', genNum, 'in=', before, 'out=', streamData.length);
+                } catch (e) {
+                    console.warn('PDFDecrypt: Failed to decrypt XRef stream:', e.message);
+                }
             }
             
-            // Parse xref stream
+            // Decompress (Filter may be a name or an array)
+            let decoded = streamData;
+            let filter = dict.Filter || dict['/Filter'];
+            if (Array.isArray(filter)) {
+                filter = filter[0];
+            }
+            if (filter === '/FlateDecode' || filter === 'FlateDecode') {
+                try {
+                    decoded = Inflate.inflate(streamData);
+                } catch (inflateError) {
+                    console.error('PDFDecrypt: Failed to inflate XRef stream:', inflateError.message);
+                    let inflated = null;
+                    for (let trim = 1; trim <= 32; trim++) {
+                        try {
+                            inflated = Inflate.inflate(streamData.slice(0, -trim));
+                            console.log('PDFDecrypt: Inflate succeeded after trimming', trim, 'bytes');
+                            break;
+                        } catch (e) {}
+                    }
+                    if (!inflated) {
+                        throw new Error('Failed to decompress XRef stream: ' + inflateError.message);
+                    }
+                    decoded = inflated;
+                }
+            }
+
+            // Undo PNG/TIFF predictors
+            let decodeParms = dict.DecodeParms || dict['/DecodeParms'] ||
+                              dict.DP || dict['/DP'];
+            if (Array.isArray(decodeParms)) {
+                decodeParms = decodeParms[0];
+            }
+            if (decodeParms && typeof decodeParms === 'object') {
+                decoded = StreamPredictor.apply(decoded, decodeParms);
+            }
+            
             const w = dict.W || dict['/W'];
             const size = dict.Size || dict['/Size'];
             const index = dict.Index || dict['/Index'] || [0, size];
             
+            if (!w || !Array.isArray(w) || w.length < 3) {
+                throw new Error('Invalid /W array in XRef stream');
+            }
+
+            const entrySize = (w[0] || 0) + (w[1] || 0) + (w[2] || 0);
+            let expectedEntries = 0;
+            for (let i = 0; i < index.length; i += 2) {
+                expectedEntries += index[i + 1] || 0;
+            }
+            const expectedBytes = expectedEntries * entrySize;
+            console.log('PDFDecrypt: XRef stream decoded length=', decoded.length,
+                'expected=', expectedBytes, 'entrySize=', entrySize, 'Size=', size,
+                'Index=', Array.isArray(index) ? index.join(',') : index);
+
+            // If still short and no DecodeParms, try PNG Up predictor with Columns=entrySize
+            if (decoded.length < expectedBytes && decoded.length > expectedBytes * 0.5) {
+                const maybe = StreamPredictor.apply(decoded, {
+                    '/Predictor': 12,
+                    '/Columns': entrySize
+                });
+                if (maybe.length >= expectedBytes || maybe.length > decoded.length) {
+                    console.log('PDFDecrypt: Applied fallback PNG predictor, out=', maybe.length);
+                    decoded = maybe;
+                }
+            }
+
+            let endedEarly = false;
             let pos = 0;
             for (let i = 0; i < index.length; i += 2) {
                 const start = index[i];
                 const count = index[i + 1];
                 
                 for (let j = 0; j < count; j++) {
+                    if (pos + entrySize > decoded.length) {
+                        console.warn('PDFDecrypt: XRef stream data ended early at object', start + j,
+                            '(decoded length ' + decoded.length + ', pos ' + pos + ')');
+                        endedEarly = true;
+                        break;
+                    }
+                    
                     let type = 1;
                     if (w[0] > 0) {
                         type = 0;
@@ -1069,13 +1599,98 @@
                         field3 = (field3 << 8) | decoded[pos++];
                     }
                     
-                    if (type === 1) {
-                        this.xref.set(`${start + j} ${field3}`, { offset: field2, gen: field3, type: 'n' });
+                    const objNumEntry = start + j;
+                    const key = `${objNumEntry} 0`;
+                    
+                    if (type === 0) {
+                        // free
+                    } else if (type === 1) {
+                        // Only accept offsets inside the file
+                        if (field2 >= 0 && field2 < this.data.length) {
+                            this.xref.set(key, { offset: field2, gen: field3, type: 'n' });
+                        } else {
+                            console.warn('PDFDecrypt: Ignoring out-of-range XRef offset', field2,
+                                'for object', objNumEntry);
+                        }
+                    } else if (type === 2) {
+                        // object stream — stream obj num must be plausible
+                        if (field2 > 0 && field2 < (size || this.data.length)) {
+                            this.objectStreams.set(key, { streamObjNum: field2, indexInStream: field3 });
+                            // Ensure we don't keep a bogus direct offset for this object
+                            this.xref.delete(key);
+                        }
                     }
                 }
+                if (endedEarly) break;
             }
             
-            this.trailer = dict;
+            if (!this.trailer) {
+                this.trailer = dict;
+                console.log('PDFDecrypt: XRef stream dictionary keys:', Object.keys(dict).join(', '));
+                if (dict['/Encrypt']) {
+                    console.log('PDFDecrypt: Found /Encrypt in XRef stream dict');
+                }
+                if (dict['/ID']) {
+                    console.log('PDFDecrypt: Found /ID in XRef stream dict');
+                }
+            }
+
+            this._lastXRefStreamEndedEarly = endedEarly;
+            this._lastXRefStreamOffset = offset;
+            this._lastXRefStreamObjNum = objNum;
+            
+            return dict['/Prev'] || null;
+        }
+
+        /**
+         * After the password/key is known, re-parse the XRef stream with decryption.
+         * Encrypted PDFs store compressed XRef bytes encrypted — first-pass inflate is wrong.
+         */
+        reparseXRefWithDecryptor(decryptor) {
+            if (!decryptor || !decryptor.isEncrypted()) return false;
+            if (typeof this._lastXRefStreamOffset !== 'number') {
+                // Try to locate startxref again
+                const startxrefPos = this.findStringReverse('startxref');
+                if (startxrefPos === -1) return false;
+                this.pos = startxrefPos + 9;
+                this.skipWhitespace();
+                this._lastXRefStreamOffset = this.parseNumber();
+            }
+
+            console.log('PDFDecrypt: Re-parsing XRef stream with decryption at', this._lastXRefStreamOffset);
+
+            // Keep trailer; rebuild object maps from decrypted stream
+            const savedTrailer = this.trailer;
+            this.xref.clear();
+            this.objectStreams.clear();
+
+            try {
+                this.parseXRefStream(this._lastXRefStreamOffset, decryptor);
+            } catch (e) {
+                console.warn('PDFDecrypt: Re-parse XRef with decrypt failed:', e.message);
+            }
+
+            if (savedTrailer && !this.trailer) this.trailer = savedTrailer;
+            else if (savedTrailer) this.trailer = savedTrailer; // keep original trailer refs
+
+            // Fill gaps / fix any remaining bad offsets via scan
+            this.scanForObjects();
+
+            // Drop bogus object-stream references
+            for (const [key, info] of Array.from(this.objectStreams.entries())) {
+                const sKey = `${info.streamObjNum} 0`;
+                const sEntry = this.xref.get(sKey);
+                if (!sEntry || sEntry.offset < 0 || sEntry.offset >= this.data.length) {
+                    console.warn('PDFDecrypt: Dropping invalid object-stream ref', key, info);
+                    this.objectStreams.delete(key);
+                }
+            }
+
+            console.log('PDFDecrypt: After decrypted XRef reparse:',
+                this.xref.size, 'direct objects,',
+                this.objectStreams.size, 'objects in streams',
+                'endedEarly=', !!this._lastXRefStreamEndedEarly);
+            return !this._lastXRefStreamEndedEarly;
         }
 
         parseTrailer() {
@@ -1336,22 +1951,364 @@
         }
 
         getEncryptDict() {
+            // If encryptDict was set directly (from raw extraction), return it
+            if (this.encryptDict && this.isValidEncryptDict(this.encryptDict)) {
+                console.log('PDFDecrypt: Using directly set encryptDict');
+                return this.encryptDict;
+            }
+            
             if (!this.trailer || !this.trailer['/Encrypt']) {
-                return null;
+                // Try to find it directly
+                this.findEncryptDictDirect(Utils.bytesToString(this.data));
+            }
+            
+            if (this.trailer && this.trailer['/Encrypt']) {
+                const encryptRef = this.trailer['/Encrypt'];
+                if (encryptRef && encryptRef.ref) {
+                    // Prefer a content-based parse: incomplete XRef streams on large PDFs
+                    // often have wrong offsets, which yields a bogus encrypt dict and
+                    // false "Invalid password" errors.
+                    let encryptDict = this.parseEncryptObjectBinary(encryptRef.num, encryptRef.gen);
+                    if (this.isValidEncryptDict(encryptDict)) {
+                        this.encryptDict = encryptDict;
+                        console.log('PDFDecrypt: Loaded encrypt dict via binary parse, V=',
+                            encryptDict['/V'], 'R=', encryptDict['/R'],
+                            'O=', encryptDict['/O'] ? encryptDict['/O'].length : 0,
+                            'U=', encryptDict['/U'] ? encryptDict['/U'].length : 0,
+                            'Length=', encryptDict['/Length'],
+                            'EncryptMetadata=', encryptDict['/EncryptMetadata']);
+                        return encryptDict;
+                    }
+
+                    encryptDict = this.getObject(encryptRef.num, encryptRef.gen);
+                    if (this.isValidEncryptDict(encryptDict)) {
+                        this.encryptDict = encryptDict;
+                        return encryptDict;
+                    }
+                    
+                    encryptDict = this.parseObjectDirectly(encryptRef.num, encryptRef.gen);
+                    if (this.isValidEncryptDict(encryptDict)) {
+                        this.encryptDict = encryptDict;
+                        return encryptDict;
+                    }
+                } else if (this.isValidEncryptDict(encryptRef)) {
+                    // Inline encrypt dictionary
+                    this.encryptDict = encryptRef;
+                    return encryptRef;
+                }
             }
 
-            const encryptRef = this.trailer['/Encrypt'];
-            if (encryptRef.ref) {
-                return this.getObject(encryptRef.num, encryptRef.gen);
+            // Last resort: locate /Filter /Standard in binary
+            const fallback = this.findStandardEncryptDictBinary();
+            if (this.isValidEncryptDict(fallback)) {
+                this.encryptDict = fallback;
+                console.log('PDFDecrypt: Loaded encrypt dict via Standard-filter binary scan');
+                return fallback;
             }
-            return encryptRef;
+
+            return null;
+        }
+
+        isValidEncryptDict(dict) {
+            if (!dict || typeof dict !== 'object' || dict.ref) return false;
+            const filter = dict['/Filter'];
+            const hasFilter = filter === '/Standard' || filter === 'Standard';
+            const hasOU = dict['/O'] != null && dict['/U'] != null;
+            return hasFilter && hasOU;
+        }
+
+        /**
+         * Parse object N G from binary by scanning for "N G obj" (last match)
+         * and reading the following value — avoids corrupt XRef offsets.
+         */
+        parseEncryptObjectBinary(num, gen) {
+            const needle = Utils.stringToBytes(`${num} ${gen} obj`);
+            let found = -1;
+            outer: for (let i = 0; i <= this.data.length - needle.length; i++) {
+                for (let j = 0; j < needle.length; j++) {
+                    if (this.data[i + j] !== needle[j]) continue outer;
+                }
+                // Ensure this isn't a longer number prefix (e.g. 12 matching 2)
+                if (i > 0) {
+                    const prev = this.data[i - 1];
+                    if (prev >= 0x30 && prev <= 0x39) continue;
+                }
+                found = i;
+            }
+            if (found === -1) return null;
+
+            this.pos = found + needle.length;
+            this.skipWhitespace();
+            try {
+                return this.parseValue();
+            } catch (e) {
+                console.warn('PDFDecrypt: parseEncryptObjectBinary failed:', e.message);
+                return null;
+            }
+        }
+
+        /**
+         * Find the dictionary that contains /Filter /Standard by binary scan.
+         */
+        findStandardEncryptDictBinary() {
+            const patterns = [
+                Utils.stringToBytes('/Filter/Standard'),
+                Utils.stringToBytes('/Filter /Standard')
+            ];
+            let filterPos = -1;
+            for (const pat of patterns) {
+                for (let i = this.data.length - pat.length; i >= 0; i--) {
+                    let ok = true;
+                    for (let j = 0; j < pat.length; j++) {
+                        if (this.data[i + j] !== pat[j]) { ok = false; break; }
+                    }
+                    if (ok) { filterPos = i; break; }
+                }
+                if (filterPos !== -1) break;
+            }
+            if (filterPos === -1) return null;
+
+            // Walk back to the start of the enclosing << dictionary
+            let dictStart = -1;
+            for (let i = filterPos; i >= 1; i--) {
+                if (this.data[i - 1] === 0x3C && this.data[i] === 0x3C) {
+                    dictStart = i - 1;
+                    break;
+                }
+            }
+            if (dictStart === -1) return null;
+
+            const saved = this.pos;
+            this.pos = dictStart;
+            try {
+                const dict = this.parseDictionary();
+                this.pos = saved;
+                return dict;
+            } catch (e) {
+                this.pos = saved;
+                console.warn('PDFDecrypt: findStandardEncryptDictBinary failed:', e.message);
+                return null;
+            }
+        }
+        
+        /**
+         * Parse an object directly by searching for it in the PDF
+         */
+        parseObjectDirectly(num, gen) {
+            return this.parseEncryptObjectBinary(num, gen);
         }
 
         getIDArray() {
-            if (!this.trailer || !this.trailer['/ID']) {
+            // If idArray was set directly (from raw extraction), return it
+            if (this.idArray) {
+                console.log('PDFDecrypt: Using directly set idArray');
+                return this.normalizeIDArray(this.idArray);
+            }
+            
+            if (this.trailer && this.trailer['/ID']) {
+                const normalized = this.normalizeIDArray(this.trailer['/ID']);
+                if (normalized) {
+                    this.idArray = normalized;
+                    return normalized;
+                }
+            }
+
+            // Prefer the last /ID in the file (current trailer)
+            const pdfStr = Utils.bytesToString(this.data);
+            let lastMatch = null;
+            const idHexRe = /\/ID\s*\[\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\]/g;
+            let m;
+            while ((m = idHexRe.exec(pdfStr)) !== null) {
+                lastMatch = m;
+            }
+            if (lastMatch) {
+                this.idArray = [
+                    Utils.hexToBytes(lastMatch[1]),
+                    Utils.hexToBytes(lastMatch[2])
+                ];
+                return this.idArray;
+            }
+
+            return null;
+        }
+
+        normalizeIDArray(id) {
+            if (!id) return null;
+            if (!Array.isArray(id) || id.length < 1) return null;
+            const out = [];
+            for (let i = 0; i < id.length; i++) {
+                let entry = id[i];
+                if (entry instanceof Uint8Array) {
+                    out.push(entry);
+                } else if (typeof entry === 'string') {
+                    out.push(Utils.stringToBytes(entry));
+                } else if (Array.isArray(entry)) {
+                    out.push(new Uint8Array(entry));
+                } else {
+                    return null;
+                }
+            }
+            return out;
+        }
+
+        /**
+         * Extract an object from an object stream
+         * @param {number} objNum - The object number to extract
+         * @param {Object} decryptor - The decryptor instance (needed to decrypt the object stream)
+         * @returns {Object} - The extracted object data as bytes
+         */
+        getObjectFromStream(objNum, decryptor) {
+            const key = `${objNum} 0`;
+            const streamInfo = this.objectStreams.get(key);
+            if (!streamInfo) {
                 return null;
             }
-            return this.trailer['/ID'];
+            
+            const { streamObjNum, indexInStream } = streamInfo;
+            
+            // Get the object stream
+            const streamObj = this.getObject(streamObjNum, 0);
+            if (!streamObj || streamObj['/Type'] !== '/ObjStm') {
+                console.warn('PDFDecrypt: Object stream', streamObjNum, 'not found or invalid type');
+                return null;
+            }
+            
+            // Get the stream data
+            const streamData = this.getStream(streamObjNum, 0);
+            if (!streamData) {
+                return null;
+            }
+            
+            // Decrypt the stream if encrypted
+            let decodedData = streamData.data;
+            if (decryptor && decryptor.isEncrypted()) {
+                try {
+                    decodedData = decryptor.decryptStream(streamData.data, streamObjNum, 0);
+                } catch (e) {
+                    console.warn('PDFDecrypt: Failed to decrypt object stream', streamObjNum, e.message);
+                }
+            }
+            
+            // Decompress if needed
+            let filter = streamObj['/Filter'];
+            if (Array.isArray(filter)) filter = filter[0];
+            if (filter === '/FlateDecode' || filter === 'FlateDecode') {
+                try {
+                    decodedData = Inflate.inflate(decodedData);
+                } catch (e) {
+                    console.warn('PDFDecrypt: Failed to decompress object stream', streamObjNum, e.message);
+                    return null;
+                }
+            }
+            
+            // Parse the object stream structure
+            const n = streamObj['/N']; // Number of objects
+            const first = streamObj['/First']; // Offset of first object
+            
+            // Parse the index (pairs of objNum, offset)
+            const indexData = Utils.bytesToString(decodedData.slice(0, first));
+            const indexParts = indexData.trim().split(/\s+/).map(Number);
+            
+            // Find our object in the index
+            let objectOffset = -1;
+            let nextOffset = decodedData.length;
+            
+            for (let i = 0; i < indexParts.length; i += 2) {
+                const indexObjNum = indexParts[i];
+                const offset = indexParts[i + 1];
+                
+                if (indexObjNum === objNum) {
+                    objectOffset = first + offset;
+                    // Get next offset for length calculation
+                    if (i + 2 < indexParts.length) {
+                        nextOffset = first + indexParts[i + 3];
+                    }
+                    break;
+                }
+            }
+            
+            if (objectOffset === -1) {
+                console.warn('PDFDecrypt: Object', objNum, 'not found in object stream', streamObjNum);
+                return null;
+            }
+            
+            // Extract the object bytes
+            const objectBytes = decodedData.slice(objectOffset, nextOffset);
+            return {
+                bytes: objectBytes,
+                streamObjNum: streamObjNum,
+                indexInStream: indexInStream
+            };
+        }
+
+        /**
+         * Get all objects stored in a specific object stream (for rebuilding)
+         */
+        extractAllFromObjectStream(streamObjNum, decryptor) {
+            // Get the object stream
+            const streamObj = this.getObject(streamObjNum, 0);
+            if (!streamObj || streamObj['/Type'] !== '/ObjStm') {
+                return [];
+            }
+            
+            // Get the stream data
+            const streamData = this.getStream(streamObjNum, 0);
+            if (!streamData) {
+                return [];
+            }
+            
+            // Decrypt the stream if encrypted
+            let decodedData = streamData.data;
+            if (decryptor && decryptor.isEncrypted()) {
+                try {
+                    decodedData = decryptor.decryptStream(streamData.data, streamObjNum, 0);
+                } catch (e) {
+                    console.warn('PDFDecrypt: Failed to decrypt object stream', streamObjNum, e.message);
+                    return [];
+                }
+            }
+            
+            // Decompress if needed
+            let filter = streamObj['/Filter'];
+            if (Array.isArray(filter)) filter = filter[0];
+            if (filter === '/FlateDecode' || filter === 'FlateDecode') {
+                try {
+                    decodedData = Inflate.inflate(decodedData);
+                } catch (e) {
+                    console.warn('PDFDecrypt: Failed to decompress object stream', streamObjNum);
+                    return [];
+                }
+            }
+            
+            // Parse the object stream structure
+            const n = streamObj['/N']; // Number of objects
+            const first = streamObj['/First']; // Offset of first object
+            
+            // Parse the index (pairs of objNum, offset)
+            const indexData = Utils.bytesToString(decodedData.slice(0, first));
+            const indexParts = indexData.trim().split(/\s+/).map(Number);
+            
+            const objects = [];
+            for (let i = 0; i < indexParts.length; i += 2) {
+                const objNum = indexParts[i];
+                const offset = indexParts[i + 1];
+                const absoluteOffset = first + offset;
+                
+                // Get next offset for length calculation
+                let nextOffset = decodedData.length;
+                if (i + 2 < indexParts.length) {
+                    nextOffset = first + indexParts[i + 3];
+                }
+                
+                const objectBytes = decodedData.slice(absoluteOffset, nextOffset);
+                objects.push({
+                    objNum: objNum,
+                    gen: 0,
+                    bytes: objectBytes
+                });
+            }
+            
+            return objects;
         }
     }
 
@@ -1382,26 +2339,45 @@
 
         getEncryptionInfo() {
             if (!this.encryptDict) return null;
+
+            const V = this.encryptDict['/V'] || 0;
+            const R = this.encryptDict['/R'] || 2;
+            // Key length in bits. Missing /Length defaults to 40 for V1, 128 for V>=2.
+            let Length = this.encryptDict['/Length'];
+            if (typeof Length !== 'number' || !Length) {
+                Length = V >= 2 ? 128 : 40;
+            }
             
             return {
-                V: this.encryptDict['/V'] || 0,
-                R: this.encryptDict['/R'] || 2,
-                Length: this.encryptDict['/Length'] || 40,
+                V: V,
+                R: R,
+                Length: Length,
                 P: this.encryptDict['/P'] || 0,
                 CF: this.encryptDict['/CF'],
                 StmF: this.encryptDict['/StmF'],
-                StrF: this.encryptDict['/StrF']
+                StrF: this.encryptDict['/StrF'],
+                EncryptMetadata: this.encryptDict['/EncryptMetadata'] !== false
             };
         }
 
         padPassword(password) {
-            const bytes = Utils.stringToBytes(password);
+            const bytes = Utils.stringToBytes(password || '');
             const padded = new Uint8Array(32);
             padded.set(bytes.slice(0, 32));
             if (bytes.length < 32) {
                 padded.set(this.passwordPadding.slice(0, 32 - bytes.length), bytes.length);
             }
             return padded;
+        }
+
+        /**
+         * Ensure O/U entries are Uint8Array (parsers may yield arrays).
+         */
+        asBytes(value) {
+            if (value instanceof Uint8Array) return value;
+            if (Array.isArray(value)) return new Uint8Array(value);
+            if (typeof value === 'string') return Utils.stringToBytes(value);
+            return null;
         }
 
         computeEncryptionKey() {
@@ -1411,25 +2387,58 @@
             console.log('PDFDecrypt: Encryption info:', info);
             
             if (info.V >= 5) {
-                // AES-256 (PDF 2.0)
                 return this.computeEncryptionKeyV5();
             }
-            
-            // Standard encryption (V1-V4)
-            const paddedPassword = this.padPassword(this.password);
-            const o = this.encryptDict['/O'];
-            const p = info.P;
+
+            // Try as user password first, then as owner password
+            if (this.tryComputeKeyAsUser(this.padPassword(this.password), keyLength, info)) {
+                console.log('PDFDecrypt: Key derived via user-password algorithm');
+                return this.encryptionKey;
+            }
+
+            const recoveredUserPad = this.recoverUserPadFromOwnerPassword(keyLength, info);
+            if (recoveredUserPad && this.tryComputeKeyAsUser(recoveredUserPad, keyLength, info)) {
+                console.log('PDFDecrypt: Key derived via owner-password algorithm');
+                return this.encryptionKey;
+            }
+
+            // Keep last attempted user-password key for callers; verification will fail
+            this.tryComputeKeyAsUser(this.padPassword(this.password), keyLength, info);
+            return this.encryptionKey;
+        }
+
+        /**
+         * Algorithm 3.2 — compute file encryption key from padded user password.
+         * Returns true if the resulting key authenticates against /U.
+         */
+        tryComputeKeyAsUser(paddedUserPassword, keyLength, info) {
+            const o = this.asBytes(this.encryptDict['/O']);
+            const u = this.asBytes(this.encryptDict['/U']);
+            if (!o || !u || !this.idArray || !this.idArray[0]) {
+                console.warn('PDFDecrypt: Missing O/U/ID for key computation',
+                    { o: !!o, u: !!u, id: !!(this.idArray && this.idArray[0]) });
+                return false;
+            }
+
+            const p = info.P | 0;
             const id = this.idArray[0];
             
-            // Build encryption key
             let input = Utils.concatBytes(
-                paddedPassword,
+                paddedUserPassword,
                 o,
-                new Uint8Array([p & 0xFF, (p >> 8) & 0xFF, (p >> 16) & 0xFF, (p >> 24) & 0xFF]),
+                new Uint8Array([
+                    p & 0xFF,
+                    (p >> 8) & 0xFF,
+                    (p >> 16) & 0xFF,
+                    (p >> 24) & 0xFF
+                ]),
                 id
             );
             
-            if (info.R >= 4 && !this.encryptDict['/EncryptMetadata']) {
+            // PDF 1.7 Algorithm 3.2 step 6:
+            // Append 4 bytes of 0xFF only when EncryptMetadata is FALSE.
+            // Absent EncryptMetadata defaults to TRUE — do NOT append.
+            if (info.R >= 4 && this.encryptDict['/EncryptMetadata'] === false) {
                 input = Utils.concatBytes(input, new Uint8Array([0xFF, 0xFF, 0xFF, 0xFF]));
             }
             
@@ -1442,48 +2451,121 @@
             }
             
             this.encryptionKey = hash.slice(0, keyLength);
-            return this.encryptionKey;
+            return this.authenticateUserKey(this.encryptionKey, u, info);
+        }
+
+        /**
+         * Algorithm 3.5 — verify file key against /U (first 16 bytes for R>=3).
+         */
+        authenticateUserKey(fileKey, u, info) {
+            let computedU;
+            
+            if (info.R >= 3) {
+                const id = this.idArray[0];
+                const input = Utils.concatBytes(this.passwordPadding, id);
+                let hash = MD5.hash(input);
+                computedU = RC4.crypt(fileKey, hash);
+                
+                for (let i = 1; i <= 19; i++) {
+                    const xorKey = new Uint8Array(fileKey.length);
+                    for (let j = 0; j < fileKey.length; j++) {
+                        xorKey[j] = fileKey[j] ^ i;
+                    }
+                    computedU = RC4.crypt(xorKey, computedU);
+                }
+                
+                for (let i = 0; i < 16; i++) {
+                    if (computedU[i] !== u[i]) return false;
+                }
+                return true;
+            }
+
+            computedU = RC4.crypt(fileKey, this.passwordPadding);
+            for (let i = 0; i < 32; i++) {
+                if (computedU[i] !== u[i]) return false;
+            }
+            return true;
+        }
+
+        /**
+         * Algorithm 3.7 / 3.3 — treat supplied password as owner password and
+         * recover the padded user password from /O.
+         */
+        recoverUserPadFromOwnerPassword(keyLength, info) {
+            const o = this.asBytes(this.encryptDict['/O']);
+            if (!o) return null;
+
+            let hash = MD5.hash(this.padPassword(this.password));
+            if (info.R >= 3) {
+                for (let i = 0; i < 50; i++) {
+                    hash = MD5.hash(hash);
+                }
+            }
+            const ownerKey = hash.slice(0, keyLength);
+
+            let userPad = new Uint8Array(o);
+            if (info.R >= 3) {
+                for (let i = 19; i >= 0; i--) {
+                    const xorKey = new Uint8Array(ownerKey.length);
+                    for (let j = 0; j < ownerKey.length; j++) {
+                        xorKey[j] = ownerKey[j] ^ i;
+                    }
+                    userPad = RC4.crypt(xorKey, userPad);
+                }
+            } else {
+                userPad = RC4.crypt(ownerKey, userPad);
+            }
+
+            return userPad.slice(0, 32);
         }
 
         computeEncryptionKeyV5() {
             // AES-256 encryption (PDF 2.0)
-            const u = this.encryptDict['/U'];
-            const ue = this.encryptDict['/UE'];
+            const u = this.asBytes(this.encryptDict['/U']);
+            const ue = this.asBytes(this.encryptDict['/UE']);
+            const o = this.asBytes(this.encryptDict['/O']);
+            const oe = this.asBytes(this.encryptDict['/OE']);
             
-            const passwordBytes = Utils.stringToBytes(this.password);
+            const passwordBytes = Utils.stringToBytes(this.password || '');
             const truncated = passwordBytes.slice(0, 127);
-            
-            // User password validation
-            const validationSalt = u.slice(32, 40);
-            const keySalt = u.slice(40, 48);
-            
-            // Compute hash for validation
-            const validationInput = Utils.concatBytes(truncated, validationSalt);
-            const validationHash = SHA256.hash(validationInput);
-            
-            // Verify password
-            const uHash = u.slice(0, 32);
-            let valid = true;
-            for (let i = 0; i < 32; i++) {
-                if (validationHash[i] !== uHash[i]) {
-                    valid = false;
-                    break;
+
+            // Try user password (U/UE)
+            if (u && ue && u.length >= 48) {
+                const validationSalt = u.slice(32, 40);
+                const keySalt = u.slice(40, 48);
+                const validationHash = SHA256.hash(Utils.concatBytes(truncated, validationSalt));
+                const uHash = u.slice(0, 32);
+                let valid = true;
+                for (let i = 0; i < 32; i++) {
+                    if (validationHash[i] !== uHash[i]) { valid = false; break; }
+                }
+                if (valid) {
+                    const keyHash = SHA256.hash(Utils.concatBytes(truncated, keySalt));
+                    const iv = new Uint8Array(16); // All zeros for UE decryption
+                    this.encryptionKey = AES.decryptCBCNoPad(keyHash, iv, ue).slice(0, 32);
+                    return this.encryptionKey;
                 }
             }
-            
-            if (!valid) {
-                throw new Error('Invalid password');
+
+            // Try owner password (O/OE) — hash includes U
+            if (o && oe && u && o.length >= 48) {
+                const validationSalt = o.slice(32, 40);
+                const keySalt = o.slice(40, 48);
+                const validationHash = SHA256.hash(Utils.concatBytes(truncated, validationSalt, u));
+                const oHash = o.slice(0, 32);
+                let valid = true;
+                for (let i = 0; i < 32; i++) {
+                    if (validationHash[i] !== oHash[i]) { valid = false; break; }
+                }
+                if (valid) {
+                    const keyHash = SHA256.hash(Utils.concatBytes(truncated, keySalt, u));
+                    const iv = new Uint8Array(16);
+                    this.encryptionKey = AES.decryptCBCNoPad(keyHash, iv, oe).slice(0, 32);
+                    return this.encryptionKey;
+                }
             }
-            
-            // Compute file encryption key
-            const keyInput = Utils.concatBytes(truncated, keySalt);
-            const keyHash = SHA256.hash(keyInput);
-            
-            // Decrypt UE to get file encryption key
-            const iv = new Uint8Array(16); // All zeros for UE decryption
-            this.encryptionKey = AES.decryptCBC(keyHash, iv, ue);
-            
-            return this.encryptionKey;
+
+            throw new Error('Invalid password');
         }
 
         verifyPassword() {
@@ -1492,48 +2574,92 @@
             const info = this.getEncryptionInfo();
             
             try {
-                this.computeEncryptionKey();
-                
+                if (!this.idArray || !this.idArray[0]) {
+                    this.idArray = this.parser.getIDArray();
+                }
+                if ((!this.idArray || !this.idArray[0]) && info.V < 5) {
+                    console.error('PDFDecrypt: Cannot verify password — missing /ID');
+                    return false;
+                }
+
+                console.log('PDFDecrypt: Verifying password, V=', info.V, 'R=', info.R,
+                    'Length=', info.Length, 'P=', info.P,
+                    'EncryptMetadata=', info.EncryptMetadata,
+                    'Olen=', this.encryptDict['/O'] ? this.asBytes(this.encryptDict['/O']).length : 0,
+                    'Ulen=', this.encryptDict['/U'] ? this.asBytes(this.encryptDict['/U']).length : 0,
+                    'IDlen=', this.idArray && this.idArray[0] ? this.idArray[0].length : 0);
+
+                this.encryptionKey = null;
+
                 if (info.V >= 5) {
-                    return true; // Already verified in computeEncryptionKeyV5
+                    this.computeEncryptionKeyV5();
+                    return true;
                 }
-                
-                // Verify using U value
-                const u = this.encryptDict['/U'];
-                let computedU;
-                
-                if (info.R >= 3) {
-                    // R3/R4 verification
-                    const id = this.idArray[0];
-                    const input = Utils.concatBytes(this.passwordPadding, id);
-                    let hash = MD5.hash(input);
-                    computedU = RC4.crypt(this.encryptionKey, hash);
-                    
-                    for (let i = 1; i <= 19; i++) {
-                        const xorKey = new Uint8Array(this.encryptionKey.length);
-                        for (let j = 0; j < this.encryptionKey.length; j++) {
-                            xorKey[j] = this.encryptionKey[j] ^ i;
-                        }
-                        computedU = RC4.crypt(xorKey, computedU);
-                    }
-                    
-                    // Compare first 16 bytes
-                    for (let i = 0; i < 16; i++) {
-                        if (computedU[i] !== u[i]) return false;
-                    }
-                } else {
-                    // R2 verification
-                    computedU = RC4.crypt(this.encryptionKey, this.passwordPadding);
-                    for (let i = 0; i < 32; i++) {
-                        if (computedU[i] !== u[i]) return false;
-                    }
+
+                const keyLength = (info.Length || 40) / 8;
+
+                // User password
+                if (this.tryComputeKeyAsUser(this.padPassword(this.password), keyLength, info)) {
+                    console.log('PDFDecrypt: Password valid (user)');
+                    return true;
                 }
-                
-                return true;
+
+                // Owner password
+                const recoveredUserPad = this.recoverUserPadFromOwnerPassword(keyLength, info);
+                if (recoveredUserPad && this.tryComputeKeyAsUser(recoveredUserPad, keyLength, info)) {
+                    console.log('PDFDecrypt: Password valid (owner)');
+                    return true;
+                }
+
+                console.log('PDFDecrypt: Password did not match user or owner');
+                return false;
             } catch (e) {
                 console.error('PDFDecrypt: Password verification failed:', e);
                 return false;
             }
+        }
+
+        /**
+         * Resolve /StmF or /StrF to an actual crypt method (/AESV2, /V2, /None, ...).
+         * Many PDFs use /StmF /StdCF with /CF << /StdCF << /CFM /AESV2 >> >>.
+         */
+        resolveCryptMethod(filterName) {
+            if (!filterName) {
+                const info = this.getEncryptionInfo();
+                // V4 defaults StmF/StrF to Identity when omitted
+                if (info.V >= 5) return '/AESV3';
+                if (info.V === 4) return '/None';
+                return '/V2';
+            }
+
+            const name = (typeof filterName === 'string')
+                ? (filterName.startsWith('/') ? filterName : '/' + filterName)
+                : null;
+            if (!name) return '/V2';
+
+            if (name === '/Identity' || name === '/None') return '/None';
+            if (name === '/AESV2' || name === '/AESV3' || name === '/V2' || name === '/AESV4') {
+                return name;
+            }
+
+            // Named filter in /CF dictionary (e.g. /StdCF)
+            const cf = this.encryptDict['/CF'];
+            if (cf && typeof cf === 'object') {
+                const filterDict = cf[name] || cf[name.replace(/^\//, '')];
+                if (filterDict && typeof filterDict === 'object') {
+                    const cfm = filterDict['/CFM'];
+                    if (cfm === '/AESV2' || cfm === '/AESV3' || cfm === '/V2' ||
+                        cfm === '/AESV4' || cfm === '/None' || cfm === '/Identity') {
+                        return cfm === '/Identity' ? '/None' : cfm;
+                    }
+                }
+            }
+
+            // Heuristic: V4 security handler almost always means AESV2 for StdCF
+            const info = this.getEncryptionInfo();
+            if (info.V >= 5) return '/AESV3';
+            if (info.V === 4) return '/AESV2';
+            return '/V2';
         }
 
         decryptStream(streamData, objNum, genNum) {
@@ -1542,20 +2668,21 @@
             }
             
             const info = this.getEncryptionInfo();
+            const method = this.resolveCryptMethod(this.encryptDict['/StmF']);
             
-            if (info.V >= 4) {
-                // Check crypto filter
-                const stmF = this.encryptDict['/StmF'];
-                if (stmF === '/AESV2' || stmF === '/AESV3') {
-                    return this.decryptAES(streamData, objNum, genNum);
+            console.log('PDFDecrypt: decryptStream obj', objNum, 'method=', method,
+                'StmF=', this.encryptDict['/StmF'], 'len=', streamData.length);
+
+            if (method === '/None' || method === '/Identity') {
+                return streamData;
+            }
+            if (method === '/AESV2' || method === '/AESV3' || method === '/AESV4' || info.V >= 5) {
+                if (info.V >= 5 || method === '/AESV3') {
+                    return this.decryptAESV3(streamData);
                 }
+                return this.decryptAES(streamData, objNum, genNum);
             }
             
-            if (info.V >= 5) {
-                return this.decryptAESV3(streamData);
-            }
-            
-            // RC4 decryption
             return this.decryptRC4(streamData, objNum, genNum);
         }
 
@@ -1565,19 +2692,36 @@
             }
             
             const info = this.getEncryptionInfo();
-            
-            if (info.V >= 4) {
-                const strF = this.encryptDict['/StrF'];
-                if (strF === '/AESV2' || strF === '/AESV3') {
-                    return this.decryptAES(stringData, objNum, genNum);
-                }
+            const method = this.resolveCryptMethod(this.encryptDict['/StrF']);
+
+            if (method === '/None' || method === '/Identity') {
+                return stringData;
             }
-            
-            if (info.V >= 5) {
-                return this.decryptAESV3(stringData);
+            if (method === '/AESV2' || method === '/AESV3' || method === '/AESV4' || info.V >= 5) {
+                if (info.V >= 5 || method === '/AESV3') {
+                    return this.decryptAESV3(stringData);
+                }
+                return this.decryptAES(stringData, objNum, genNum);
             }
             
             return this.decryptRC4(stringData, objNum, genNum);
+        }
+
+        /**
+         * True if this stream dictionary says use Identity crypt (do not decrypt).
+         */
+        streamUsesIdentityCrypt(dictStr) {
+            if (!dictStr) return false;
+            // /Filter /Crypt or /Filter [/Crypt ...] with /Name /Identity
+            if (/\/Name\s*\/Identity/.test(dictStr) && /\/Crypt/.test(dictStr)) {
+                return true;
+            }
+            // EncryptMetadata false → Metadata streams are not encrypted
+            if (this.encryptDict['/EncryptMetadata'] === false &&
+                /\/Type\s*\/Metadata/.test(dictStr)) {
+                return true;
+            }
+            return false;
         }
 
         decryptRC4(data, objNum, genNum) {
@@ -1596,6 +2740,10 @@
         }
 
         decryptAES(data, objNum, genNum) {
+            if (!data || data.length < 32) {
+                console.warn('PDFDecrypt: AES stream too short for obj', objNum, 'len=', data ? data.length : 0);
+                return data;
+            }
             // Create object key
             const objKey = Utils.concatBytes(
                 this.encryptionKey,
@@ -1615,6 +2763,9 @@
         }
 
         decryptAESV3(data) {
+            if (!data || data.length < 32) {
+                return data;
+            }
             // AES-256: key is used directly
             const iv = data.slice(0, 16);
             const ciphertext = data.slice(16);
@@ -1678,16 +2829,236 @@
     
     const PDFDecrypt = {
         /**
+         * Extract ID array directly from raw PDF
+         */
+        extractIDArrayFromRaw: function(pdfData) {
+            const pdfStr = Utils.bytesToString(pdfData);
+            
+            // Look for /ID array in trailer or elsewhere
+            const idMatch = pdfStr.match(/\/ID\s*\[\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\]/);
+            if (idMatch) {
+                console.log('PDFDecrypt: Extracted ID array from raw PDF');
+                return [
+                    Utils.hexToBytes(idMatch[1]),
+                    Utils.hexToBytes(idMatch[2])
+                ];
+            }
+            
+            // Try alternative format with parentheses
+            const idMatch2 = pdfStr.match(/\/ID\s*\[\s*\(([^)]*)\)\s*\(([^)]*)\)\s*\]/);
+            if (idMatch2) {
+                console.log('PDFDecrypt: Extracted ID array (literal string format) from raw PDF');
+                return [
+                    Utils.stringToBytes(idMatch2[1]),
+                    Utils.stringToBytes(idMatch2[2])
+                ];
+            }
+            
+            console.log('PDFDecrypt: Could not find ID array in raw PDF');
+            return null;
+        },
+        
+        /**
+         * Extract encryption dictionary parameters directly from raw PDF
+         */
+        extractEncryptDictFromRaw: function(pdfData) {
+            const pdfStr = Utils.bytesToString(pdfData);
+            
+            console.log('PDFDecrypt: Attempting raw encryption dict extraction...');
+            
+            // Find the encryption dictionary by looking for /Filter /Standard
+            // Prefer the last match (most recent incremental update / trailer area)
+            let filterIdx = -1;
+            const filterRe = /\/Filter\s*\/Standard/g;
+            let m;
+            while ((m = filterRe.exec(pdfStr)) !== null) {
+                filterIdx = m.index;
+            }
+            if (filterIdx === -1) {
+                console.log('PDFDecrypt: Could not find /Filter /Standard in raw PDF');
+                return null;
+            }
+            
+            // Find the start of the dictionary containing this filter
+            let dictStart = filterIdx;
+            let depth = 0;
+            while (dictStart > 0) {
+                if (pdfStr.substr(dictStart, 2) === '<<') {
+                    if (depth === 0) break;
+                    depth--;
+                } else if (pdfStr.substr(dictStart, 2) === '>>') {
+                    depth++;
+                }
+                dictStart--;
+            }
+            
+            // Find the object number by searching backwards for "X Y obj"
+            const beforeDict = pdfStr.substring(Math.max(0, dictStart - 100), dictStart);
+            const objMatch = beforeDict.match(/(\d+)\s+(\d+)\s+obj\s*$/);
+            if (objMatch) {
+                console.log('PDFDecrypt: Found encrypt dict object number:', objMatch[1]);
+            }
+            
+            // Find the end of the dictionary
+            let dictEnd = dictStart + 2;
+            depth = 1;
+            while (dictEnd < pdfStr.length && depth > 0) {
+                if (pdfStr.substr(dictEnd, 2) === '<<') {
+                    depth++;
+                    dictEnd += 2;
+                } else if (pdfStr.substr(dictEnd, 2) === '>>') {
+                    depth--;
+                    dictEnd += 2;
+                } else {
+                    dictEnd++;
+                }
+            }
+            
+            const dictContent = pdfStr.substring(dictStart, dictEnd);
+            console.log('PDFDecrypt: Found encryption dict (length ' + dictContent.length + ')');
+            
+            const encryptDict = {};
+            
+            // Extract /V (version)
+            const vMatch = dictContent.match(/\/V\s+(\d+)/);
+            if (vMatch) encryptDict['/V'] = parseInt(vMatch[1], 10);
+            
+            // Extract /R (revision)
+            const rMatch = dictContent.match(/\/R\s+(\d+)/);
+            if (rMatch) encryptDict['/R'] = parseInt(rMatch[1], 10);
+            
+            // Extract /P (permissions)
+            const pMatch = dictContent.match(/\/P\s+(-?\d+)/);
+            if (pMatch) encryptDict['/P'] = parseInt(pMatch[1], 10);
+            
+            // Extract /Length (key length — not stream length). Prefer value near /V|/R.
+            const lenMatch = dictContent.match(/\/Length\s+(\d+)/);
+            if (lenMatch) encryptDict['/Length'] = parseInt(lenMatch[1], 10);
+            
+            // Helper: parse PDF literal string `(...)` with escapes into bytes
+            const parseLiteralStringAt = (str, openParenIdx) => {
+                const result = [];
+                let i = openParenIdx + 1;
+                let depth = 1;
+                while (i < str.length && depth > 0) {
+                    const ch = str.charCodeAt(i++);
+                    if (ch === 0x5C) { // backslash
+                        if (i >= str.length) break;
+                        const next = str.charCodeAt(i++);
+                        if (next === 0x6E) result.push(0x0A);
+                        else if (next === 0x72) result.push(0x0D);
+                        else if (next === 0x74) result.push(0x09);
+                        else if (next === 0x62) result.push(0x08);
+                        else if (next === 0x66) result.push(0x0C);
+                        else if (next >= 0x30 && next <= 0x37) {
+                            let octal = next - 0x30;
+                            for (let k = 0; k < 2 && i < str.length; k++) {
+                                const d = str.charCodeAt(i);
+                                if (d >= 0x30 && d <= 0x37) {
+                                    octal = (octal << 3) | (d - 0x30);
+                                    i++;
+                                } else break;
+                            }
+                            result.push(octal & 0xFF);
+                        } else {
+                            result.push(next & 0xFF);
+                        }
+                    } else if (ch === 0x28) { // (
+                        depth++;
+                        result.push(ch);
+                    } else if (ch === 0x29) { // )
+                        depth--;
+                        if (depth > 0) result.push(ch);
+                    } else {
+                        result.push(ch & 0xFF);
+                    }
+                }
+                return new Uint8Array(result);
+            };
+            
+            const extractByteString = (key) => {
+                // Hex form: /O <...>
+                const hexRe = new RegExp('\\/' + key + '\\s*<([0-9A-Fa-f]+)>');
+                const hexMatch = dictContent.match(hexRe);
+                if (hexMatch) {
+                    return Utils.hexToBytes(hexMatch[1]);
+                }
+                // Literal form: /O (...)
+                const litRe = new RegExp('\\/' + key + '\\s*\\(');
+                const litMatch = dictContent.match(litRe);
+                if (litMatch) {
+                    return parseLiteralStringAt(dictContent, litMatch.index + litMatch[0].length - 1);
+                }
+                return null;
+            };
+            
+            const oBytes = extractByteString('O');
+            if (oBytes) encryptDict['/O'] = oBytes;
+            
+            const uBytes = extractByteString('U');
+            if (uBytes) encryptDict['/U'] = uBytes;
+            
+            const oeBytes = extractByteString('OE');
+            if (oeBytes) encryptDict['/OE'] = oeBytes;
+            
+            const ueBytes = extractByteString('UE');
+            if (ueBytes) encryptDict['/UE'] = ueBytes;
+            
+            const permsBytes = extractByteString('Perms');
+            if (permsBytes) encryptDict['/Perms'] = permsBytes;
+            
+            // Extract crypt filter info
+            const stmfMatch = dictContent.match(/\/StmF\s*\/(\w+)/);
+            if (stmfMatch) encryptDict['/StmF'] = '/' + stmfMatch[1];
+            
+            const strfMatch = dictContent.match(/\/StrF\s*\/(\w+)/);
+            if (strfMatch) encryptDict['/StrF'] = '/' + strfMatch[1];
+            
+            encryptDict['/Filter'] = '/Standard';
+            
+            console.log('PDFDecrypt: Extracted encryption params - V:', encryptDict['/V'], 'R:', encryptDict['/R'],
+                'O:', encryptDict['/O'] ? encryptDict['/O'].length : 0,
+                'U:', encryptDict['/U'] ? encryptDict['/U'].length : 0);
+            
+            return encryptDict;
+        },
+        
+        /**
          * Check if a PDF is encrypted
          */
         isEncrypted: function(pdfData) {
             try {
+                if (!(pdfData instanceof Uint8Array)) {
+                    pdfData = new Uint8Array(pdfData);
+                }
+
                 const parser = new PDFParser(pdfData);
                 parser.parse();
                 const decryptor = new PDFDecryptor(parser, '');
-                return decryptor.isEncrypted();
+                const isEnc = decryptor.isEncrypted();
+                
+                // Double-check by looking for encryption markers in raw PDF.
+                // IMPORTANT: search head + tail (not only first 50KB) so large
+                // encrypted PDFs whose /Encrypt lives near startxref still match.
+                if (!isEnc) {
+                    if (Utils.hasEncryptionMarkers(pdfData)) {
+                        console.log('PDFDecrypt: Found encryption markers in PDF (head/tail scan) - appears encrypted');
+                        return true;
+                    }
+                }
+                
+                return isEnc;
             } catch (e) {
                 console.error('PDFDecrypt: Error checking encryption:', e);
+                // On error, check raw PDF for encryption markers (full head+tail)
+                try {
+                    if (Utils.hasEncryptionMarkers(pdfData)) {
+                        console.log('PDFDecrypt: Found encryption markers in PDF despite parse error');
+                        return true;
+                    }
+                } catch (e2) {
+                    // Ignore
+                }
                 return false;
             }
         },
@@ -1712,14 +3083,140 @@
          */
         verifyPassword: function(pdfData, password) {
             try {
+                if (!(pdfData instanceof Uint8Array)) {
+                    pdfData = new Uint8Array(pdfData);
+                }
+
                 const parser = new PDFParser(pdfData);
                 parser.parse();
-                const decryptor = new PDFDecryptor(parser, password);
+                let decryptor = new PDFDecryptor(parser, password);
+
+                // If parser missed the encrypt dict (common on large XRef-stream PDFs),
+                // recover it from raw bytes before treating the file as unencrypted.
+                if (!decryptor.isEncrypted() && Utils.hasEncryptionMarkers(pdfData)) {
+                    console.log('PDFDecrypt: verifyPassword — recovering encrypt dict from raw PDF');
+                    parser.findEncryptDictDirect(Utils.bytesToString(pdfData));
+                    decryptor = new PDFDecryptor(parser, password);
+                    if (!decryptor.isEncrypted()) {
+                        const encryptDict = this.extractEncryptDictFromRaw(pdfData);
+                        if (encryptDict) {
+                            parser.encryptDict = encryptDict;
+                            if (!parser.idArray) {
+                                parser.idArray = this.extractIDArrayFromRaw(pdfData);
+                            }
+                            decryptor = new PDFDecryptor(parser, password);
+                        }
+                    }
+                }
+
+                if (!decryptor.isEncrypted()) {
+                    // Truly not encrypted
+                    return true;
+                }
+
                 return decryptor.verifyPassword();
             } catch (e) {
                 console.error('PDFDecrypt: Error verifying password:', e);
                 return false;
             }
+        },
+
+        /**
+         * Decrypt encrypted strings within a PDF object
+         * @param {string} objStr - The object content as string
+         * @param {number} objNum - Object number
+         * @param {number} genNum - Generation number
+         * @param {PDFDecryptor} decryptor - The decryptor instance
+         * @returns {string} - Object with decrypted strings
+         */
+        decryptObjectStrings: function(objStr, objNum, genNum, decryptor) {
+            // Decrypt literal strings (...)
+            let result = objStr;
+            
+            // Find and decrypt literal strings
+            const literalRegex = /\(([^)]*(?:\)[^)]*)*)\)/g;
+            result = result.replace(literalRegex, (match) => {
+                try {
+                    // Parse the string content (handle escapes)
+                    const content = match.slice(1, -1);
+                    const bytes = [];
+                    let i = 0;
+                    while (i < content.length) {
+                        if (content[i] === '\\') {
+                            i++;
+                            if (i >= content.length) break;
+                            const next = content[i];
+                            if (next === 'n') bytes.push(0x0A);
+                            else if (next === 'r') bytes.push(0x0D);
+                            else if (next === 't') bytes.push(0x09);
+                            else if (next === 'b') bytes.push(0x08);
+                            else if (next === 'f') bytes.push(0x0C);
+                            else if (next >= '0' && next <= '7') {
+                                let octal = next;
+                                if (content[i+1] >= '0' && content[i+1] <= '7') {
+                                    i++;
+                                    octal += content[i];
+                                    if (content[i+1] >= '0' && content[i+1] <= '7') {
+                                        i++;
+                                        octal += content[i];
+                                    }
+                                }
+                                bytes.push(parseInt(octal, 8));
+                            } else {
+                                bytes.push(next.charCodeAt(0));
+                            }
+                        } else {
+                            bytes.push(content.charCodeAt(i));
+                        }
+                        i++;
+                    }
+                    
+                    if (bytes.length === 0) return match;
+                    
+                    const encrypted = new Uint8Array(bytes);
+                    const decrypted = decryptor.decryptString(encrypted, objNum, genNum);
+                    
+                    // Convert back to PDF string format
+                    let str = '(';
+                    for (let j = 0; j < decrypted.length; j++) {
+                        const c = decrypted[j];
+                        if (c === 0x0A) str += '\\n';
+                        else if (c === 0x0D) str += '\\r';
+                        else if (c === 0x09) str += '\\t';
+                        else if (c === 0x08) str += '\\b';
+                        else if (c === 0x0C) str += '\\f';
+                        else if (c === 0x28) str += '\\(';
+                        else if (c === 0x29) str += '\\)';
+                        else if (c === 0x5C) str += '\\\\';
+                        else if (c >= 32 && c < 127) str += String.fromCharCode(c);
+                        else str += '\\' + c.toString(8).padStart(3, '0');
+                    }
+                    str += ')';
+                    return str;
+                } catch (e) {
+                    // If decryption fails, return original
+                    return match;
+                }
+            });
+            
+            // Find and decrypt hex strings <...>
+            // But skip dictionary markers << and >>
+            const hexRegex = /<([0-9A-Fa-f\s]+)>/g;
+            result = result.replace(hexRegex, (match, hexContent) => {
+                try {
+                    const hex = hexContent.replace(/\s/g, '');
+                    if (hex.length === 0) return match;
+                    
+                    const bytes = Utils.hexToBytes(hex.length % 2 ? hex + '0' : hex);
+                    const decrypted = decryptor.decryptString(bytes, objNum, genNum);
+                    
+                    return '<' + Utils.bytesToHex(decrypted) + '>';
+                } catch (e) {
+                    return match;
+                }
+            });
+            
+            return result;
         },
 
         /**
@@ -1737,9 +3234,53 @@
             const parser = new PDFParser(pdfData);
             parser.parse();
             
-            // Check encryption
-            const decryptor = new PDFDecryptor(parser, password);
-            if (!decryptor.isEncrypted()) {
+            // Check encryption - also do a raw check to be sure
+            let decryptor = new PDFDecryptor(parser, password);
+            let isEnc = decryptor.isEncrypted();
+            
+            console.log('PDFDecrypt: Initial encryption check:', isEnc);
+            
+            // Double-check by looking for encryption markers in raw PDF
+            // For large PDFs, encryption dict is usually near the end — scan head+tail
+            if (!isEnc) {
+                const hasEncryptMarker = Utils.hasEncryptionMarkers(pdfData);
+                
+                console.log('PDFDecrypt: Raw PDF has encryption markers:', hasEncryptMarker);
+                
+                if (hasEncryptMarker) {
+                    console.log('PDFDecrypt: Found encryption markers in raw PDF, trying to parse encrypt dict...');
+                    // Try to find and parse the encrypt dict directly (use full file)
+                    const pdfStr = Utils.bytesToString(pdfData);
+                    parser.findEncryptDictDirect(pdfStr);
+                    // Re-create decryptor with updated parser
+                    decryptor = new PDFDecryptor(parser, password);
+                    isEnc = decryptor.isEncrypted();
+                    console.log('PDFDecrypt: After findEncryptDictDirect, isEncrypted:', isEnc);
+                    
+                    if (!isEnc) {
+                        console.log('PDFDecrypt: Still cannot find encryption dict, attempting raw extraction...');
+                        // Try to extract encryption parameters directly from PDF
+                        const encryptDict = this.extractEncryptDictFromRaw(pdfData);
+                        console.log('PDFDecrypt: Raw extraction result:', encryptDict ? 'found' : 'not found');
+                        if (encryptDict) {
+                            console.log('PDFDecrypt: V=' + encryptDict['/V'] + ', R=' + encryptDict['/R'] + 
+                                       ', O len=' + (encryptDict['/O'] ? encryptDict['/O'].length : 0) +
+                                       ', U len=' + (encryptDict['/U'] ? encryptDict['/U'].length : 0));
+                            parser.encryptDict = encryptDict;
+                            // Also extract ID array if not already found
+                            if (!parser.idArray) {
+                                parser.idArray = this.extractIDArrayFromRaw(pdfData);
+                                console.log('PDFDecrypt: ID array extracted:', parser.idArray ? 'yes' : 'no');
+                            }
+                            decryptor = new PDFDecryptor(parser, password);
+                            isEnc = decryptor.isEncrypted();
+                            console.log('PDFDecrypt: After raw extraction, isEncrypted:', isEnc);
+                        }
+                    }
+                }
+            }
+            
+            if (!isEnc) {
                 console.log('PDFDecrypt: PDF is not encrypted, returning as-is');
                 return pdfData;
             }
@@ -1752,22 +3293,146 @@
             }
             
             console.log('PDFDecrypt: Password verified, rebuilding PDF...');
+
+            // Re-parse XRef with decryption — required for encrypted XRef streams
+            try {
+                parser.reparseXRefWithDecryptor(decryptor);
+            } catch (e) {
+                console.warn('PDFDecrypt: XRef reparse warning:', e.message);
+            }
+
+
+            // Log crypt methods so AES-via-StdCF misdetects are obvious in console
+            try {
+                console.log('PDFDecrypt: StmF=', decryptor.encryptDict['/StmF'],
+                    '→', decryptor.resolveCryptMethod(decryptor.encryptDict['/StmF']),
+                    'StrF=', decryptor.encryptDict['/StrF'],
+                    '→', decryptor.resolveCryptMethod(decryptor.encryptDict['/StrF']));
+            } catch (e) {}
             
-            // STRATEGY: Rebuild the PDF properly
-            // 1. Collect all objects
-            // 2. Decrypt streams (keep them compressed - don't decompress)
-            // 3. Decrypt strings
-            // 4. Write new PDF with correct lengths and xref
+            // STRATEGY: Rebuild PDF with decrypted content using BINARY chunks
+            // (string concatenation corrupts / is unsafe for large stream payloads)
             
-            const objects = [];
+            const chunks = [];
+            let outputLength = 0;
+            const appendBytes = (bytes) => {
+                if (!(bytes instanceof Uint8Array)) bytes = new Uint8Array(bytes);
+                chunks.push(bytes);
+                outputLength += bytes.length;
+            };
+            const appendStr = (str) => appendBytes(Utils.stringToBytes(str));
+            
+            appendStr('%PDF-1.7\n%\xE2\xE3\xCF\xD3\n');
+            
             const objectOffsets = [];
-            let output = '%PDF-1.7\n%\xE2\xE3\xCF\xD3\n';
             
             // Get encrypt dict ref to skip it
-            const encryptRef = parser.trailer['/Encrypt'];
-            const encryptObjNum = encryptRef ? encryptRef.num : -1;
+            const encryptRef = parser.trailer && parser.trailer['/Encrypt'];
+            const encryptObjNum = (encryptRef && encryptRef.ref) ? encryptRef.num
+                : (encryptRef && typeof encryptRef.num === 'number' ? encryptRef.num : -1);
             
-            // Process all objects from xref
+            // Collect object streams to skip (we'll extract their contents instead)
+            const objectStreamNums = new Set();
+            for (const [key, info] of parser.objectStreams.entries()) {
+                objectStreamNums.add(info.streamObjNum);
+            }
+            
+            const removeEncryptionFromDict = (dictStr) => {
+                dictStr = dictStr.replace(/\/Encrypt\s+\d+\s+\d+\s+R\s*/g, '');
+                dictStr = dictStr.replace(/\/Encrypt\s*<<[^>]*(?:<<[^>]*>>[^>]*)*>>\s*/g, '');
+                dictStr = dictStr.replace(/\/EncryptMetadata\s+(true|false)\s*/gi, '');
+                dictStr = dictStr.replace(/\/Perms\s+\d+\s+\d+\s+R\s*/g, '');
+                dictStr = dictStr.replace(/\/Perms\s*<<[^>]*>>\s*/g, '');
+                dictStr = dictStr.replace(/\/CF\s*<<[^>]*(?:<<[^>]*>>[^>]*)*>>\s*/g, '');
+                dictStr = dictStr.replace(/\/StmF\s*\/\w+\s*/g, '');
+                dictStr = dictStr.replace(/\/StrF\s*\/\w+\s*/g, '');
+                dictStr = dictStr.replace(/\/EFF\s*\/\w+\s*/g, '');
+                dictStr = dictStr.replace(/\/AuthEvent\s*\/\w+\s*/g, '');
+                dictStr = dictStr.replace(/\/Recipients\s*\[[^\]]*\]\s*/g, '');
+                // Strip /Crypt from Filter arrays (no longer encrypted)
+                dictStr = dictStr.replace(/\/Filter\s*\[\s*\/Crypt\s*/g, '/Filter [');
+                dictStr = dictStr.replace(/\/Filter\s*\/Crypt\b\s*/g, '');
+                dictStr = dictStr.replace(/\/DecodeParms\s*\[\s*<<[^>]*\/Type\s*\/CryptFilterDecodeParms[^>]*>>\s*/g, '/DecodeParms [');
+                dictStr = dictStr.replace(/\/DecodeParms\s*<<[^>]*\/Type\s*\/CryptFilterDecodeParms[^>]*>>\s*/g, '');
+                dictStr = dictStr.replace(/\s{2,}/g, ' ');
+                return dictStr;
+            };
+            
+            const isXRefStream = (objStr) => objStr.includes('/Type') && objStr.includes('/XRef');
+            const isEncryptionDictObject = (objStr) => {
+                return (objStr.includes('/Filter') && objStr.includes('/Standard')) ||
+                       (objStr.includes('/V ') && objStr.includes('/R ') &&
+                        (objStr.includes('/O ') || objStr.includes('/U ')));
+            };
+
+            /**
+             * Locate stream payload using /Length (avoids false "endstream" hits inside binary).
+             */
+            const extractStreamPayload = (objBytes, objStr) => {
+                const streamKeywordPos = objStr.indexOf('stream');
+                if (streamKeywordPos === -1) return null;
+
+                let streamDataStart = streamKeywordPos + 6;
+                if (objBytes[streamDataStart] === 0x0D) streamDataStart++;
+                if (objBytes[streamDataStart] === 0x0A) streamDataStart++;
+
+                let length = null;
+                const lenMatch = objStr.substring(0, streamKeywordPos).match(/\/Length\s+(\d+)(?!\s+\d+\s+R)/);
+                if (lenMatch) {
+                    length = parseInt(lenMatch[1], 10);
+                }
+
+                let streamDataEnd;
+                if (typeof length === 'number' && length >= 0 &&
+                    streamDataStart + length <= objBytes.length) {
+                    streamDataEnd = streamDataStart + length;
+                } else {
+                    // Fallback: search for endstream as bytes (not via latin1 indexOf on whole obj)
+                    const endMarker = Utils.stringToBytes('endstream');
+                    streamDataEnd = -1;
+                    outer: for (let i = streamDataStart; i <= objBytes.length - endMarker.length; i++) {
+                        for (let j = 0; j < endMarker.length; j++) {
+                            if (objBytes[i + j] !== endMarker[j]) continue outer;
+                        }
+                        streamDataEnd = i;
+                        break;
+                    }
+                    if (streamDataEnd === -1) return null;
+                    while (streamDataEnd > streamDataStart &&
+                           (objBytes[streamDataEnd - 1] === 0x0A || objBytes[streamDataEnd - 1] === 0x0D)) {
+                        streamDataEnd--;
+                    }
+                }
+
+                return {
+                    streamKeywordPos,
+                    dictPart: objStr.substring(0, streamKeywordPos),
+                    encryptedStream: objBytes.slice(streamDataStart, streamDataEnd)
+                };
+            };
+
+            /**
+             * Find endobj boundary without scanning through stream binary via string search.
+             */
+            const findObjectEnd = (startOffset) => {
+                // Quick ASCII scan for 'endobj' at byte level
+                const marker = Utils.stringToBytes('endobj');
+                for (let i = startOffset; i <= pdfData.length - marker.length; i++) {
+                    let ok = true;
+                    for (let j = 0; j < marker.length; j++) {
+                        if (pdfData[i + j] !== marker[j]) { ok = false; break; }
+                    }
+                    if (ok) {
+                        // Prefer matches that look like token boundaries
+                        const before = i > 0 ? pdfData[i - 1] : 0x0A;
+                        if (before === 0x0A || before === 0x0D || before === 0x20) {
+                            return i + marker.length;
+                        }
+                    }
+                }
+                return pdfData.length;
+            };
+            
             const sortedXref = Array.from(parser.xref.entries())
                 .map(([key, value]) => {
                     const [num, gen] = key.split(' ').map(Number);
@@ -1775,161 +3440,206 @@
                 })
                 .sort((a, b) => a.num - b.num);
             
-            console.log('PDFDecrypt: Processing', sortedXref.length, 'objects');
+            console.log('PDFDecrypt: Processing', sortedXref.length, 'direct objects');
+            console.log('PDFDecrypt: Processing', parser.objectStreams.size, 'objects from object streams');
+            
+            const processedObjects = new Set();
+            let streamDecryptCount = 0;
+            let streamSkipCount = 0;
             
             for (const entry of sortedXref) {
                 const { num, gen, offset } = entry;
                 
-                // Skip the encrypt dictionary object
                 if (num === encryptObjNum) {
                     console.log('PDFDecrypt: Skipping encrypt object', num);
                     continue;
                 }
                 
-                // Record offset for new xref
-                objectOffsets.push({ num, gen, offset: output.length });
-                
-                // Read original object
-                parser.pos = offset;
-                parser.skipWhitespace();
-                
-                // Find the extent of this object
-                const objStartPos = offset;
-                let objEndPos = pdfData.length;
-                
-                // Find 'endobj' or 'endstream...endobj'
-                let searchPos = offset;
-                const endObjStr = 'endobj';
-                while (searchPos < pdfData.length - 6) {
-                    if (Utils.bytesToString(pdfData.slice(searchPos, searchPos + 6)) === endObjStr) {
-                        objEndPos = searchPos + 6;
-                        break;
-                    }
-                    searchPos++;
+                if (objectStreamNums.has(num)) {
+                    continue;
                 }
                 
-                // Extract the raw object bytes
-                const objBytes = pdfData.slice(objStartPos, objEndPos);
+                if (typeof offset !== 'number' || offset < 0 || offset >= pdfData.length) {
+                    console.warn('PDFDecrypt: Bad offset for object', num, offset);
+                    continue;
+                }
+
+                const objEndPos = findObjectEnd(offset);
+                const objBytes = pdfData.slice(offset, objEndPos);
+                // Only decode the dictionary portion as string when needed — for type checks use a head sample
+                const headSample = Utils.bytesToString(objBytes.slice(0, Math.min(objBytes.length, 2048)));
                 const objStr = Utils.bytesToString(objBytes);
                 
-                // Check if this object has a stream
-                const streamKeywordPos = objStr.indexOf('stream');
-                const endstreamPos = objStr.indexOf('endstream');
+                if (isXRefStream(headSample)) {
+                    console.log('PDFDecrypt: Skipping XRef stream object', num);
+                    continue;
+                }
                 
-                if (streamKeywordPos !== -1 && endstreamPos !== -1 && streamKeywordPos < endstreamPos) {
-                    // This is a stream object - need to decrypt the stream
-                    
-                    // Find where stream data starts (after 'stream' and newline)
-                    let streamDataStart = streamKeywordPos + 6;
-                    if (objBytes[streamDataStart] === 0x0D) streamDataStart++;
-                    if (objBytes[streamDataStart] === 0x0A) streamDataStart++;
-                    
-                    // Find where stream data ends (before 'endstream')
-                    let streamDataEnd = endstreamPos;
-                    if (objBytes[streamDataEnd - 1] === 0x0A) streamDataEnd--;
-                    if (objBytes[streamDataEnd - 1] === 0x0D) streamDataEnd--;
-                    
-                    // Extract stream data
-                    const encryptedStream = objBytes.slice(streamDataStart, streamDataEnd);
-                    
-                    // Decrypt the stream (but DON'T decompress - keep FlateDecode)
-                    let decryptedStream;
-                    try {
-                        decryptedStream = decryptor.decryptStream(encryptedStream, num, gen);
-                    } catch (e) {
-                        console.warn('PDFDecrypt: Failed to decrypt stream', num, e.message);
-                        decryptedStream = encryptedStream; // Keep original if decryption fails
+                if (isEncryptionDictObject(headSample)) {
+                    console.log('PDFDecrypt: Skipping encryption dict object', num);
+                    continue;
+                }
+                
+                processedObjects.add(num);
+                objectOffsets.push({ num, gen, offset: outputLength });
+
+                const streamInfo = extractStreamPayload(objBytes, objStr);
+                
+                if (streamInfo) {
+                    const { dictPart, encryptedStream } = streamInfo;
+                    let decryptedStream = encryptedStream;
+
+                    const skipCrypt = decryptor.streamUsesIdentityCrypt(dictPart);
+                    if (skipCrypt) {
+                        streamSkipCount++;
+                    } else {
+                        try {
+                            decryptedStream = decryptor.decryptStream(encryptedStream, num, gen);
+                            streamDecryptCount++;
+                        } catch (e) {
+                            console.warn('PDFDecrypt: Failed to decrypt stream', num, e.message);
+                            decryptedStream = encryptedStream;
+                        }
                     }
                     
-                    // Get the dictionary part (before 'stream')
-                    let dictPart = objStr.substring(0, streamKeywordPos);
+                    let newDict = removeEncryptionFromDict(dictPart);
+                    newDict = newDict.replace(/\/Length\s+\d+(\s+\d+\s+R)?/g, '/Length ' + decryptedStream.length);
                     
-                    // Update the /Length in dictionary to match decrypted stream size
-                    dictPart = dictPart.replace(/\/Length\s+\d+(\s+\d+\s+R)?/g, '/Length ' + decryptedStream.length);
-                    
-                    // Build the new object
-                    output += dictPart;
-                    output += 'stream\n';
-                    output += Utils.bytesToString(decryptedStream);
-                    output += '\nendstream\nendobj\n';
-                    
+                    appendStr(newDict);
+                    appendStr('stream\n');
+                    appendBytes(decryptedStream);
+                    appendStr('\nendstream\nendobj\n');
                 } else {
-                    // Regular object (no stream) - may contain encrypted strings
-                    // For now, copy as-is (string decryption is complex)
-                    // Most PDFs don't have sensitive data in strings
-                    output += objStr + '\n';
+                    let cleaned = removeEncryptionFromDict(objStr);
+                    // Avoid decrypting strings inside binary-looking content without stream keyword
+                    cleaned = this.decryptObjectStrings(cleaned, num, gen, decryptor);
+                    if (!/\bendobj\s*$/.test(cleaned)) {
+                        cleaned = cleaned.replace(/\s*$/, '') + '\nendobj\n';
+                    } else if (!cleaned.endsWith('\n')) {
+                        cleaned += '\n';
+                    }
+                    appendStr(cleaned);
                 }
             }
             
-            // Write xref table
-            const xrefOffset = output.length;
+            // Objects from object streams
+            const objectsByStream = new Map();
+            for (const [key, info] of parser.objectStreams.entries()) {
+                const [num] = key.split(' ').map(Number);
+                if (processedObjects.has(num) || num === encryptObjNum) continue;
+                if (!objectsByStream.has(info.streamObjNum)) {
+                    objectsByStream.set(info.streamObjNum, []);
+                }
+                objectsByStream.get(info.streamObjNum).push({ num, key, info });
+            }
             
-            // Sort by object number
+            const isEncryptionDict = (content) => {
+                return content.includes('/Filter') &&
+                       (content.includes('/Standard') || content.includes('/Adobe.PubSec')) &&
+                       (content.includes('/V ') || content.includes('/R ') || content.includes('/O ') || content.includes('/U '));
+            };
+            
+            for (const [streamObjNum, objects] of objectsByStream.entries()) {
+                console.log('PDFDecrypt: Extracting objects from object stream', streamObjNum);
+                
+                let extractedObjects = [];
+                try {
+                    extractedObjects = parser.extractAllFromObjectStream(streamObjNum, decryptor) || [];
+                } catch (e) {
+                    console.warn('PDFDecrypt: Failed extracting object stream', streamObjNum, e.message);
+                }
+                
+                for (const extracted of extractedObjects) {
+                    if (processedObjects.has(extracted.objNum) || extracted.objNum === encryptObjNum) {
+                        continue;
+                    }
+                    
+                    let objContent = Utils.bytesToString(extracted.bytes).trim();
+                    
+                    if (isEncryptionDict(objContent)) continue;
+                    if (objContent.includes('/Type') && objContent.includes('/XRef')) continue;
+                    
+                    processedObjects.add(extracted.objNum);
+                    objContent = removeEncryptionFromDict(objContent);
+                    objContent = this.decryptObjectStrings(objContent, extracted.objNum, 0, decryptor);
+                    
+                    objectOffsets.push({ num: extracted.objNum, gen: 0, offset: outputLength });
+                    appendStr(`${extracted.objNum} 0 obj\n`);
+                    appendStr(objContent + '\n');
+                    appendStr('endobj\n');
+                }
+            }
+            
+            console.log('PDFDecrypt: Decrypted streams=', streamDecryptCount,
+                'identity/skipped=', streamSkipCount,
+                'objects written=', objectOffsets.length);
+            
+            // xref table
+            const xrefOffset = outputLength;
             objectOffsets.sort((a, b) => a.num - b.num);
-            
-            // Find max object number for xref size
-            const maxObjNum = objectOffsets.length > 0 ? 
+            const maxObjNum = objectOffsets.length > 0 ?
                 Math.max(...objectOffsets.map(e => e.num)) : 0;
             
-            // Create a map for quick lookup
             const offsetMap = new Map();
             for (const entry of objectOffsets) {
                 offsetMap.set(entry.num, entry.offset);
             }
             
-            output += 'xref\n';
-            output += '0 ' + (maxObjNum + 1) + '\n';
-            output += '0000000000 65535 f \n';
+            appendStr('xref\n');
+            appendStr('0 ' + (maxObjNum + 1) + '\n');
+            appendStr('0000000000 65535 f \n');
             
-            // Write xref entries for all objects up to maxObjNum
             for (let i = 1; i <= maxObjNum; i++) {
                 if (offsetMap.has(i)) {
-                    output += String(offsetMap.get(i)).padStart(10, '0') + ' 00000 n \n';
+                    appendStr(String(offsetMap.get(i)).padStart(10, '0') + ' 00000 n \n');
                 } else {
-                    // Free entry for missing/skipped objects
-                    output += '0000000000 65535 f \n';
+                    appendStr('0000000000 65535 f \n');
                 }
             }
             
-            // Write trailer (without /Encrypt)
-            output += 'trailer\n<<\n';
-            output += '/Size ' + (maxObjNum + 1) + '\n';
+            appendStr('trailer\n<<\n');
+            appendStr('/Size ' + (maxObjNum + 1) + '\n');
             
-            // Copy Root reference
-            if (parser.trailer['/Root']) {
+            if (parser.trailer && parser.trailer['/Root']) {
                 const root = parser.trailer['/Root'];
-                output += '/Root ' + root.num + ' ' + root.gen + ' R\n';
-            }
-            
-            // Copy Info reference if present
-            if (parser.trailer['/Info']) {
-                const info = parser.trailer['/Info'];
-                output += '/Info ' + info.num + ' ' + info.gen + ' R\n';
-            }
-            
-            // Copy ID if present (some viewers need this)
-            if (parser.trailer['/ID']) {
-                const id = parser.trailer['/ID'];
-                output += '/ID [';
-                for (const idPart of id) {
-                    output += '<' + Utils.bytesToHex(idPart) + '>';
+                if (root.ref || (typeof root.num === 'number')) {
+                    appendStr('/Root ' + root.num + ' ' + (root.gen || 0) + ' R\n');
                 }
-                output += ']\n';
             }
             
-            output += '>>\n';
-            output += 'startxref\n';
-            output += xrefOffset + '\n';
-            output += '%%EOF\n';
+            if (parser.trailer && parser.trailer['/Info']) {
+                const infoRef = parser.trailer['/Info'];
+                if (infoRef.ref || (typeof infoRef.num === 'number')) {
+                    appendStr('/Info ' + infoRef.num + ' ' + (infoRef.gen || 0) + ' R\n');
+                }
+            }
             
-            console.log('PDFDecrypt: Decryption complete, output size:', output.length);
-            return Utils.stringToBytes(output);
+            const idArr = parser.getIDArray && parser.getIDArray();
+            if (idArr && idArr.length) {
+                appendStr('/ID [');
+                for (const idPart of idArr) {
+                    appendStr('<' + Utils.bytesToHex(idPart) + '>');
+                }
+                appendStr(']\n');
+            }
+            
+            appendStr('>>\n');
+            appendStr('startxref\n');
+            appendStr(xrefOffset + '\n');
+            appendStr('%%EOF\n');
+            
+            const result = Utils.concatBytes.apply(null, chunks);
+            console.log('PDFDecrypt: Decryption complete, output size:', result.length);
+
+            // Sanity: output must still look like a PDF
+            const outHead = Utils.bytesToString(result.slice(0, 8));
+            if (!outHead.startsWith('%PDF')) {
+                throw new Error('Decryption produced invalid PDF header');
+            }
+
+            return result;
         },
 
-        /**
-         * Alternative approach: Extract content and create new clean PDF
-         * Use this if the byte-level approach doesn't work well
-         */
         decryptAndRebuild: async function(pdfData, password) {
             console.log('PDFDecrypt: Starting decrypt and rebuild...');
             
